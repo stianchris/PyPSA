@@ -59,7 +59,7 @@ except:
 
 
 def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='b',
-         line_colors='g', bus_sizes=10, line_widths=2, title="",
+         line_colors='g', bus_sizes=10, flow=None, line_widths=2, title="",
          line_cmap=None, bus_cmap=None, boundaries=None,
          geometry=False, branch_components=['Line', 'Link'], jitter=None):
     """
@@ -198,12 +198,26 @@ def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='b',
                                              labels=(np.zeros(len(index)),
                                                      np.arange(len(index)))))
 
+    branch_collections = []
+    
     line_colors = as_branch_series(line_colors)
-    line_widths = as_branch_series(line_widths)
+    if flow is None:    
+        line_widths = as_branch_series(line_widths)
+    else:
+        # take line_widths as argument for scaling the arrows and linewidths
+        assert ~(isinstance(line_widths, float) | isinstance(line_widths, int)
+                | line_widths is None), """Setting flow and line_widths for each branch
+                is not possible. For a given flow, the argument line_widths 
+                is restricted to a scaling factor only"""
+        # set a rough estimate of the linescales which scales the size of the arrows
+        # and lines for the default line_widths=2
+        flow_scale = (len(network.lines)+100)**1.7 * 2./line_widths
+        arrows = directed_flow(network, flow, ax=ax, flow_scale=flow_scale)
+        branch_collections.append(arrows)
+        line_widths = as_branch_series(flow/flow_scale)
     if not isinstance(line_cmap, dict):
         line_cmap = {'Line': line_cmap}
 
-    branch_collections = []
     for c in network.iterate_components(branch_components):
         l_defaults = defaults_for_branches[c.name]
         l_widths = line_widths.get(c.name, l_defaults['width'])
@@ -437,3 +451,56 @@ def iplot(network, fig=None, bus_colors='blue',
             pltly.iplot(fig)
 
     return fig
+
+
+
+def directed_flow(network, flow, flow_scale=None, ax=None):
+#    this funtion is used for diplaying arrows representing the network flow
+    from matplotlib.patches import FancyArrow
+    if ax is None:
+        ax = plt.gca()
+#    set the scale of the arrowsizes
+    linecoords = pd.DataFrame({'x1':network.lines.bus0.map(network.buses.x), 
+                           'y1':network.lines.bus0.map(network.buses.y),
+                           'x2':network.lines.bus1.map(network.buses.x),
+                           'y2':network.lines.bus1.map(network.buses.y),    
+                            #make area not width proportional to flow
+                           'arrowsize': flow.abs()
+                                        .pipe(lambda ds: np.sqrt(ds/flow_scale))
+                                        .clip(lower=1e-8), 
+                           'direction': np.sign(flow)})
+    linecoords['linelength'] = (np.sqrt((linecoords.x1-linecoords.x2)**2.+
+                                        (linecoords.y1 - linecoords.y2)**2))
+    linecoords['arrowtolarge'] = (1.5 * linecoords.arrowsize 
+                                            > linecoords.loc[:, 'linelength'])
+
+    #swap coords for negativ directions
+    linecoords.loc[linecoords.direction==-1., ['x1', 'x2', 'y1', 'y2']] = (
+        linecoords.loc[linecoords.direction==-1., ['x2', 'x1', 'y2', 'y1']].values)
+    
+    linecoords['arrows'] = (
+            linecoords[(linecoords.linelength>0.)&(~linecoords.arrowtolarge)]
+                .apply(lambda ds: 
+                    FancyArrow(ds.x1, ds.y1, 
+                               0.6*(ds.x2 - ds.x1)-ds.arrowsize
+                                   *0.75*(ds.x2 - ds.x1)/ds.linelength,
+                               0.6*(ds.y2 - ds.y1)-ds.arrowsize
+                                   *0.75*(ds.y2 - ds.y1)/ds.linelength,
+                               head_width=ds.arrowsize
+                               ), axis=1) )
+    linecoords.loc[(linecoords.linelength>0.)&(linecoords.arrowtolarge), 'arrows']= ( 
+            linecoords[(linecoords.linelength>0.)&(linecoords.arrowtolarge)]
+                .apply(lambda ds: 
+                    FancyArrow(ds.x1, ds.y1, 
+                               0.001*(ds.x2 - ds.x1),
+                               0.001*(ds.y2 - ds.y1),
+                               head_width=ds.arrowsize
+                               ), axis=1) ) 
+    arrowcol = PatchCollection(linecoords[linecoords.arrows.notnull()].arrows, 
+                              color='darkgreen',
+                              edgecolors='k',
+                              linewidths=0., 
+                              zorder=2, alpha=1)
+    ax.add_collection(arrowcol)
+    
+    return arrowcol
