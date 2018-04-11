@@ -15,12 +15,12 @@ import xarray as xr
 import logging
 logger = logging.getLogger(__name__)
 from .pf import calculate_PTDF
-from numpy.linalg import inv
+from numpy.linalg import inv, pinv
 
 
 
 #%% utility functions
-def to_diag(series):
+def diag(series):
     return pd.DataFrame(np.diagflat(series.values), 
                         index=series.index, columns=series.index)
     
@@ -39,39 +39,81 @@ def PTDF(network, slacked=False):
 
 #%% 
 
-def average_participation(network, snapshot, normalized=False, return_exports=True):
+def average_participation(network, snapshot, per_bus=False, normalized=False, 
+                          downstream=True):
+#   principally follow Hoersch, Jonas; "Flow tracing as a tool set for the 
+#   analysis of networked large-scale renewable electricity systems"
+#   and use matrix notation to derive Q.
+
     buses = network.buses.index
     lines = network.lines.index
-#   use matrix formulation for flow allocation
-    K = pd.DataFrame(network.incidence_matrix(branch_components={'Line', 'Link'}, busorder=buses).todense(), 
-                     index=buses, columns=lines)
-    F = to_diag(network.lines_t.p0.loc[snapshot])
-    P_plus = to_diag(network.buses_t.p.loc[snapshot])
-    exported_source_flows = K.dot(F).clip_lower(0).dot(np.sign(F)).dot(K.T) \
-                        .clip_upper(0).pipe(lambda df:df/df.abs().sum().replace(0,1))
-#   define colorflow matrix
-    C = P_plus.dot( 
-            pd.DataFrame(inv(np.eye(len(buses)) - exported_source_flows) ,
-                         index=buses, columns=buses) )
-#   normalize such that each column of the Colormatrix sums up to one
+    links = network.links.index
+    f_in = (network.lines_t.p0.loc[[snapshot]].T
+             .append(network.links_t.p0.loc[ [snapshot]].T))
+    f_out =  (- network.lines_t.p1.loc[[snapshot]].T
+             .append(network.links_t.p1.loc[[snapshot]].T))
+    p = network.buses_t.p.loc[[snapshot]].T
+    K = pd.DataFrame(network.incidence_matrix(branch_components={'Line', 'Link'}, 
+                                              busorder=buses).todense(), 
+                     index=buses, columns=lines.append(links))
+#    set incidence matrix in direction of flow
+    K = K.mul(np.sign(f_in[snapshot]))
+    f_in = f_in.abs()    
+    f_out = f_out.abs()
+
+    n_in =  K.clip_upper(0).dot(f_in).abs() #network inflow
+    n_out = K.clip_lower(0).dot(f_out) #network outflow
+    p_in = p.clip_lower(0) #nodal inflow
+    p_out = p.clip_upper(0).abs() #nodal outflow
+    
+    # flows from bus (index) to bus (columns):
+    F = (K.dot(diag(f_in)).clip_lower(0).dot(K.T).clip_upper(0).abs()) 
+
+    F_in = (p_in + n_in)[snapshot] 
+#   F_in = F_out = (p_out + n_out)[snapshot]
+
+#   upstream
+    Q = pd.DataFrame(inv(diag(F_in) - F.T).dot(diag(p_in)),
+                     index = buses, columns = buses)
+#   downstream
+    R = pd.DataFrame(inv(diag(F_in) - F).dot(diag(p_out)),
+                     index = buses, columns = buses)
+#    equation (12)
+#    (Q.T.dot(diag(p_out)).T == R.T.dot(diag(p_in)) ).all().all()    
+    
+    if per_bus and normalized:
+        return Q
+    if per_bus:
+        Q = (Q.mul(p_out[snapshot], axis=0)
+                .rename_axis('bus/sink').rename_axis('bus/source', axis=1)
+                .stack()[lambda ds:ds!=0])
+        if downstream:
+            return Q
+        else:
+#            equal to weighting and stacking (from above) with R:
+            return Q.swaplevel(0).sort_index()
+
+#    create artificial injection patterns following the flow trace    
+    if downstream:
+        T = Q.copy()
+        weight = (p_in + p_out)[snapshot]
+        ref_b = p_in[snapshot] == 0
+        tag = '/source'
+    else:
+        T = R.copy()
+        weight = F_in
+        ref_b = p_out[snapshot] == 0
+        tag = '/sink'
+        
+    T = T.mul((weight), axis=0)
+    T = (pd.DataFrame(np.diagflat(np.diag(T)), index=T.index, columns=T.columns) \
+         - T[ref_b].reindex_like(T).fillna(0))
+    T = PTDF(network).dot(T).round(10)
     if normalized:
-        C = C.pipe(lambda df:df/df.sum())
-    if return_exports:
-    #   define colorized exports on each line
-        exports = C.dot(K).clip_lower(0)
-    #   normalize the exports such that they are equal to the line flow
-        exports *= F.sum()/exports.sum().replace(0,1)
-        #transform to multi-index to simplify export to xarray         
-        exports = exports.rename_axis('bus').rename_axis("line", axis=1)
-        exports = exports.stack()[lambda ds:ds!=0]
-        return pd.concat([exports], keys=[snapshot], names=['snapshots'])
-
-#   likewise define imports, not correct yet
-    imports = C.dot(K).clip_upper(0)
-    imports /= imports.sum()*F.sum()    
-    return imports.stack()[lambda ds:ds!=0]
-
-
+        T.div(f_in[snapshot], axis=0)
+    T = T.rename_axis('line').rename_axis('bus' + tag , axis=1).T
+    T = T.stack()[lambda ds:ds!=0]
+    return pd.concat([T], keys=[snapshot], names=['snapshots'])
 
 
 def marginal_participation(network, snapshot, Q=0.5, normalized=False):
@@ -97,10 +139,10 @@ def virtual_injection_pattern(network, snapshot, normalized=False):
     p_plus = p.clip_lower(0)
     p_minus = p.clip_upper(0)
     f = network.lines_t.p0.loc[snapshot]
-    diag = to_diag(p_plus)
+    indiag = diag(p_plus)
     offdiag = (p_minus.to_frame().dot(p_plus.to_frame().T).div(p_plus.sum())
                 .pipe(lambda df: df - np.diagflat(np.diag(df))) )
-    vip = diag + offdiag
+    vip = indiag + offdiag
 #    normalized colorvectors
     if normalized:
         c = H.dot(vip).div(f, axis=0).fillna(0).T
@@ -111,15 +153,15 @@ def virtual_injection_pattern(network, snapshot, normalized=False):
     return pd.concat([c], keys=[snapshot], names=['snapshots'])
 
 
-def minimization_method(network, snapshot, **kwargs):
+def minimized_flow_shares(network, snapshot, **kwargs):
     
     from scipy.optimize import minimize
     H = PTDF(network)
     #    f = network.lines_t.p0.loc[snapshot]
     p = network.buses_t.p.loc[snapshot]
-    diag = to_diag(p*p)
+    indiag = diag(p*p)
     offdiag = p.to_frame().dot(p.to_frame().T).clip_upper(0)
-    pp = diag + offdiag
+    pp = indiag + offdiag
     N = len(network.buses)
     
     def minimization(df):
@@ -146,11 +188,12 @@ def minimization_method(network, snapshot, **kwargs):
     return c
 
 
-def flow_allocation(network, snapshots, method='average_participation'):
+
+def flow_allocation(network, snapshots, method='Average participation'):
     """
     Function to allocate the total network flow to buses. Available methods are
-    'Average participation', 'Marginal Participation', 'Virtual Injection Pattern',
-    ...
+    'Average participation', 'Marginal participation', 'Virtual injection pattern',
+    'Least square color flows'. 
     
     
     
@@ -167,7 +210,7 @@ def flow_allocation(network, snapshots, method='average_participation'):
                 
             - 'Average participation': 
             - 'Marginal participation':
-            - 'Virtual Injection Pattern':
+            - 'Virtual injection pattern':
             - 'Least square color flows': 
                 
     Returns
@@ -182,19 +225,43 @@ def flow_allocation(network, snapshots, method='average_participation'):
     if network.lines_t.p0.shape[0] == 0:
         raise ValueError('Flows are not given by the network, please solve the network flows first')
     
-    if method=='average_participation':
+    if method=='Average participation':
         method_func = average_participation
-#    elif 
-    
-#    initialize basic quanitties
-#    flow = xr.DataArray(network.lines_t.p0)
-#    flow.attrs['units'] = 'MW'
-    if isinstance(str, snapshots):
+    elif method=='Marginal Participation':
+        method_func = marginal_participation
+    elif method=='Virtual injection pattern':
+        method_func = virtual_injection_pattern
+    elif method=='Least square color flows':
+        method_func = minimization_method
+    else:
+         raise(ValueError(""""Method not implemented, please choose one out of 
+                          ['Average participation', 'Marginal participation',
+                           'Virtual injection pattern','Least square color flows']"""))
+
+    if isinstance(snapshots, str):
         snapshots = [snapshots]
     
     flow = pd.concat([method_func(network, sn) for sn in snapshots])
 #    preliminary: define cost as the average usage of all lines 
     cost = flow.abs().groupby(level='bus').mean()
-    return flow, cost
+    return {"flow":flow, "cost":cost}
     
           
+
+#%% testings
+    
+
+#def flow_distribution_factors(network, snapshot):
+#    F = diag(network.lines_t.p0.loc[snapshot])
+#    K = pd.DataFrame(network.incidence_matrix(busorder=network.buses.index).todense(),
+#                        columns=network.lines.index, index=network.buses.index)
+#    Z = pd.DataFrame(F.dot(K.T).dot(np.linalg.pinv(K.dot(F).dot(K.T))
+#            ).values, columns=network.buses.index, index=network.lines.index)
+#    P = diag(network.buses_t.p.loc[snapshot]).clip_lower(0)
+#    P_minus = network.buses_t.p.loc[snapshot].clip_upper(0)
+#    P.apply(lambda df: df - P_minus/P_minus.sum()*df.sum())
+#    return Z.dot(P)    
+
+
+    
+
