@@ -141,6 +141,7 @@ class ExporterCSV(Exporter):
 class ImporterHDF5(Importer):
     def __init__(self, path):
         self.ds = pd.HDFStore(path)
+        self.index = {}
 
     def get_attributes(self):
         return dict(self.ds["/network"].reset_index().iloc[0])
@@ -149,18 +150,30 @@ class ImporterHDF5(Importer):
         return self.ds["/snapshots"] if "/snapshots" in self.ds else None
 
     def get_static(self, list_name):
-        return (self.ds["/" + list_name]
-                if "/" + list_name in self.ds else None)
+        if "/" + list_name not in self.ds:
+            return None
+
+        if self.pypsa_version is None or self.pypsa_version < [0, 13, 1]:
+            df = self.ds["/" + list_name]
+        else:
+            df = self.ds["/" + list_name].set_index('name')
+
+        self.index[list_name] = df.index
+        return df
 
     def get_series(self, list_name):
         for tab in self.ds:
             if tab.startswith('/' + list_name + '_t/'):
                 attr = tab[len('/' + list_name + '_t/'):]
-                yield attr, self.ds[tab]
+                df = self.ds[tab]
+                if self.pypsa_version is not None and self.pypsa_version > [0, 13, 0]:
+                    df.columns = self.index[list_name][df.columns]
+                yield attr, df
 
 class ExporterHDF5(Exporter):
     def __init__(self, path, **kwargs):
         self.ds = pd.HDFStore(path, mode='w', **kwargs)
+        self.index = {}
 
     def save_attributes(self, attrs):
         name = attrs.pop('name')
@@ -172,9 +185,13 @@ class ExporterHDF5(Exporter):
         self.ds.put('/snapshots', snapshots, format='table', index=False)
 
     def save_static(self, list_name, df):
+        df.index.name = 'name'
+        self.index[list_name] = df.index
+        df = df.reset_index()
         self.ds.put('/' + list_name, df, format='table', index=False)
 
     def save_series(self, list_name, attr, df):
+        df.columns = self.index[list_name].get_indexer(df.columns)
         self.ds.put('/' + list_name + '_t/' + attr, df, format='table', index=False)
 
 if has_xarray:
@@ -201,16 +218,21 @@ if has_xarray:
                     if attr.startswith('network_')}
 
         def get_snapshots(self):
-            return self.get_static('snapshots')
+            return self.get_static('snapshots', 'snapshots')
 
-        def get_static(self, list_name):
+        def get_static(self, list_name, index_name=None):
             t = list_name + '_'
             i = len(t)
-            df = pd.DataFrame.from_dict({attr[i:]: self.ds[attr].to_pandas()
-                                         for attr in iterkeys(self.ds.data_vars)
-                                         if attr.startswith(t) and attr[i:i+2] != 't_'})
-            df.index.name = 'name'
-            return df if not df.empty else None
+            if index_name is None:
+                index_name = list_name + '_i'
+            if index_name not in self.ds.coords:
+                return None
+            index = self.ds.coords[index_name].to_index().rename('name')
+            df = pd.DataFrame(index=index)
+            for attr in iterkeys(self.ds.data_vars):
+                if attr.startswith(t) and attr[i:i+2] != 't_':
+                    df[attr[i:]] = self.ds[attr].to_pandas()
+            return df
 
         def get_series(self, list_name):
             t = list_name + '_t_'
@@ -229,7 +251,7 @@ if has_xarray:
 
         def save_attributes(self, attrs):
             self.ds.attrs.update(('network_' + attr, val)
-                                for attr, val in iteritems(attrs))
+                                 for attr, val in iteritems(attrs))
 
         def save_snapshots(self, snapshots):
             snapshots.index.name = 'snapshots'
@@ -238,6 +260,7 @@ if has_xarray:
 
         def save_static(self, list_name, df):
             df.index.name = list_name + '_i'
+            self.ds[list_name + '_i'] = df.index
             for attr in df.columns:
                 self.ds[list_name + '_' + attr] = df[attr]
 
@@ -413,10 +436,6 @@ def import_from_hdf5(network, path, skip_time=False):
         Skip reading in time dependent attributes
     """
 
-    logger.warning(dedent("""HDF5 file format for PyPSA is now deprecated,
-        because HDF5 fails for tables with more than 1000 columns.
-        Please use netCDF instead."""))
-
     basename = os.path.basename(path)
     with ImporterHDF5(path) as importer:
         _import_from_importer(network, importer, basename=basename, skip_time=skip_time)
@@ -444,10 +463,6 @@ def export_to_hdf5(network, path, export_standard_types=False, **kwargs):
     OR
     >>> network.export_to_hdf5(filename)
     """
-
-    logger.warning(dedent("""HDF5 file format for PyPSA is now deprecated,
-        because HDF5 fails for tables with more than 1000 columns.
-        Please use netCDF instead."""))
 
     kwargs.setdefault('complevel', 4)
 
@@ -530,25 +545,31 @@ def _import_from_importer(network, importer, basename, skip_time=False):
     """
 
     attrs = importer.get_attributes()
+
+    current_pypsa_version = [int(s) for s in network.pypsa_version.split(".")]
+    pypsa_version = None
+
     if attrs is not None:
         network.name = attrs.pop('name')
 
-        ##https://docs.python.org/3/tutorial/datastructures.html#comparing-sequences-and-other-types
-        current_pypsa_version = [int(s) for s in network.pypsa_version.split(".")]
         try:
             pypsa_version = [int(s) for s in attrs.pop("pypsa_version").split(".")]
         except KeyError:
             pypsa_version = None
 
-        if pypsa_version is None or pypsa_version < current_pypsa_version:
-            logger.warning(dedent("""
+        for attr, val in iteritems(attrs):
+            setattr(network, attr, val)
+
+    ##https://docs.python.org/3/tutorial/datastructures.html#comparing-sequences-and-other-types
+    if pypsa_version is None or pypsa_version < current_pypsa_version:
+        logger.warning(dedent("""
                 Importing PyPSA from older version of PyPSA than current version {}.
                 Please read the release notes at https://pypsa.org/doc/release_notes.html
                 carefully to prepare your network for import.
-            """).format(network.pypsa_version))
+        """).format(network.pypsa_version))
 
-        for attr, val in iteritems(attrs):
-            setattr(network, attr, val)
+    importer.pypsa_version = pypsa_version
+    importer.current_pypsa_version = current_pypsa_version
 
     # if there is snapshots.csv, read in snapshot data
     df = importer.get_snapshots()

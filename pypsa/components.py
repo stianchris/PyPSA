@@ -605,6 +605,20 @@ class Network(Basic):
             df.drop(df.columns.intersection(names), axis=1, inplace=True)
 
 
+    def _retrieve_overridden_components(self):
+
+        components_index = list(self.components.keys())
+
+        cols = ["list_name","description","type"]
+
+        override_components = pd.DataFrame([[self.components[i][c] for c in cols] for i in components_index],
+                                           columns=cols,
+                                           index=components_index)
+
+        override_component_attrs = Dict({i : self.component_attrs[i].copy() for i in components_index})
+
+        return override_components, override_component_attrs
+
 
     def copy(self, with_time=True, ignore_standard_types=False):
         """
@@ -628,7 +642,11 @@ class Network(Basic):
 
         """
 
-        network = self.__class__(ignore_standard_types=ignore_standard_types)
+        override_components, override_component_attrs = self._retrieve_overridden_components()
+
+        network = self.__class__(ignore_standard_types=ignore_standard_types,
+                                 override_components=override_components,
+                                 override_component_attrs=override_component_attrs)
 
         for component in self.iterate_components(["Bus", "Carrier"] + sorted(self.all_components - {"Bus","Carrier"})):
             df = component.df
@@ -684,7 +702,8 @@ class Network(Basic):
         else:
             time_i = slice(None)
 
-        n = self.__class__()
+        override_components, override_component_attrs = self._retrieve_overridden_components()
+        n = self.__class__(override_components=override_components, override_component_attrs=override_component_attrs)
         n.import_components_from_dataframe(
             pd.DataFrame(self.buses.ix[key]).assign(sub_network=""),
             "Bus"
