@@ -1208,7 +1208,6 @@ def extract_optimisation_results(network, snapshots, formulation="angles", free_
               .sum(level=1) \
               .reindex(columns=network.buses_t.p.columns, fill_value=0.)
 
-
     # passive branches
     passive_branches = get_values(model.passive_branch_p)
     flow_lower = get_shadows(model.flow_lower)

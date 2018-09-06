@@ -6,49 +6,103 @@ Created on Wed Feb 21 12:14:49 2018
 @author: fabian
 """
 
-#This side-package is created for use as flow and cost allocation.
+# This side-package is created for use as flow and cost allocation.
 
-import pandas as pd
-import pypsa as ps
-import numpy as np
-import xarray as xr
-import logging
-logger = logging.getLogger(__name__)
 from .pf import calculate_PTDF
 from numpy.linalg import inv, pinv
+import pandas as pd
+import numpy as np
+import logging
+logger = logging.getLogger(__name__)
 
 
-
-#%% utility functions
-
-def diag(series):
-    return pd.DataFrame(np.diagflat(series.values),
-                        index=series.index, columns=series.index)
+# %% utility functions
 
 
-def incidence_matrix(n):
+def diag(df):
+    """
+    Convenience function to select diagonal from a square matrix, or to build
+    a diagonal matrix from a series.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame or pandas.Series
+    """
+    if isinstance(df, pd.DataFrame):
+        if len(df.columns) == len(df.index) > 1:
+            return pd.DataFrame(np.diagflat(np.diag(df)), df.index, df.columns)
+    return pd.DataFrame(np.diagflat(df.values),
+                        index=df.index, columns=df.index)
+
+
+def incidence_matrix(n, branch_components=['Link', 'Line']):
     buses = n.buses.index
-    lines = n.lines.index
-    links = n.links.index
-    return pd.DataFrame(
-            n.incidence_matrix(branch_components={'Line', 'Link'},
-                               busorder=buses).todense(),
-            index=buses, columns=lines.append(links))
+    K = []
+    for c in n.iterate_components(branch_components):
+        K.append((c.df.assign(K=1).set_index('bus0', append=True)['K']
+                 .unstack().reindex(columns=buses).fillna(0)
+                 - c.df.assign(K=1).set_index('bus1', append=True)['K']
+                 .unstack().reindex(columns=buses).fillna(0)).T)
+    return pd.concat(K, axis=1)
 
 
-def PTDF(n, slacked=False):
-    if slacked:
+def PTDF(n, slack_bus=False, branch_components={'Line'}):
+    n.lines = n.lines.assign(carrier=n.lines.bus0.map(n.buses.carrier))
+    assert (n.lines.carrier == n.lines.bus1.map(n.buses.carrier)).all()
+    if slack_bus:
         n.determine_n_topology()
         calculate_PTDF(n.sub_ns.obj[0])
         return pd.DataFrame(n.sub_ns.obj[0].PTDF,
                             columns=n.buses.index, index=n.lines.index)
     else:
-        K = pd.DataFrame(n.incidence_matrix(busorder=n.buses.index).todense())
-        Omega = pd.DataFrame(np.diagflat(1/n.lines.x_pu.values))
+        K = incidence_matrix(n, branch_components)
+        omega = pd.Series()
+        if 'Line' in branch_components:
+            omega = (omega
+                     .append(1/(n.lines.x_pu.where(n.lines.carrier == 'AC', 0)
+                             + n.lines.r_pu.where(n.lines.carrier == 'DC', 0)))
+                     )
+        if 'Link' in branch_components:
+            omega = omega.append(pd.Series(1, n.links.index))
+        Omega = diag(omega)
         return pd.DataFrame(
                 Omega.dot(K.T).dot(
                         np.linalg.pinv(K.dot(Omega).dot(K.T))).values,
-                columns=n.buses.index, index=n.lines.index)
+                columns=n.buses.index, index=omega.index)
+
+
+def PFDF(n, snapshot):
+    #  ACDC (link and line) network injection
+    p = (pd.concat({c.name:
+         c.pnl.p.multiply(c.df.sign, axis=1)
+         .groupby(c.df.bus, axis=1).sum()
+         for c in n.iterate_components(n.controllable_one_port_components)},
+            sort=True)
+         .sum(level=1)
+         .reindex(index=[snapshot],
+                  columns=n.buses_t.p.columns,
+                  fill_value=0.)).T
+
+    f = pd.concat([n.lines_t.p0.loc[[snapshot]], n.links_t.p0.loc[[snapshot]]],
+                  axis=1)
+    return p.dot(1/len(f)/f)
+#    n.determine_network_topology()
+#    H = []
+#    carrier = []
+#    for i in n.sub_networks.index:
+#        sub = n.sub_networks.at[i, 'obj']
+#        if sub.buses().shape[0] == 1:
+#            continue
+#        carrier.append(i)
+#        sub.calculate_PTDF()
+#        H.append(pd.DataFrame(sub.PTDF,
+#                              sub.branches().loc['Line'].index,
+#                              sub.buses().index))
+#    return pd.concat(H, keys=carrier, sort=False,
+#                     names=['subnet', 'lines']).fillna(0)
+
+
+
 
 
 #%%
@@ -126,32 +180,37 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
     p_in = p.clip_lower(0)  # nodal inflow
     p_out = p.clip_upper(0).abs()  # nodal outflow
 
+    F_in = (p_in + n_in)[snapshot]
+    nzero_i = F_in[F_in != 0].index
+#   F_in = F_out = (p_out + n_out)[snapshot]
+
     # flows from bus (index) to bus (columns):
     F = (K.dot(diag(f_in)).clip_lower(0).dot(K.T).clip_upper(0).abs())
 
-    F_in = (p_in + n_in)[snapshot]
-#   F_in = F_out = (p_out + n_out)[snapshot]
-
     # upstream
-    Q = pd.DataFrame(inv(diag(F_in) - F.T).dot(diag(p_in)),
-                     index=buses, columns=buses)
+    Q = (pd.DataFrame(inv((diag(F_in) - F.T).loc[nzero_i, nzero_i])
+                      .dot(diag(p_in.reindex(nzero_i))),
+                      index=nzero_i, columns=nzero_i)
+         .reindex(index=buses, columns=buses, fill_value=0))
     # downstream
-    R = pd.DataFrame(inv(diag(F_in) - F).dot(diag(p_out)),
-                     index=buses, columns=buses)
+    R = (pd.DataFrame(inv((diag(F_in) - F).loc[nzero_i, nzero_i])
+                      .dot(diag(p_out.reindex(nzero_i))),
+                      index=nzero_i, columns=nzero_i)
+         .reindex(index=buses, columns=buses, fill_value=0))
+
     #  equation (12)
     #  (Q.T.dot(diag(p_out)).T == R.T.dot(diag(p_in)) ).all().all()
 
-    if per_bus and normalized:
-        return Q
     if per_bus:
-        Q = (Q.mul(p_out[snapshot], axis=0)
-             .rename_axis('bus/sink').rename_axis('bus/source', axis=1)
+        if not normalized:
+            Q = Q.mul(p_out[snapshot], axis=0)
+        Q = (Q.rename_axis('bus/sink').rename_axis('bus/source', axis=1)
              .stack()[lambda ds: ds != 0])
         if downstream:
-            T = Q
+            T = Q.swaplevel(0).sort_index()
         else:
             #  equal to weighting and stacking (from above) with R:
-            T = Q.swaplevel(0).sort_index()
+            T = Q
 
 #    create artificial injection patterns following the flow trace
     else:
@@ -167,10 +226,8 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
             tag = '/sink'
 
         T = T.mul((weight), axis=0)
-        T = (pd.DataFrame(np.diagflat(np.diag(T)),
-                          index=T.index, columns=T.columns)
-             - T[ref_b].reindex_like(T).fillna(0))
-        T = PTDF(n).dot(T).round(10)
+        T = diag(T) - T[ref_b].reindex_like(T, fill_value=0)
+        T = PTDF(n, branch_components=['Link', 'Line']).dot(T).round(10)
         if normalized:
             T.div(f_in[snapshot], axis=0)
         T = T.rename_axis('line').rename_axis('bus' + tag, axis=1).T
@@ -274,13 +331,13 @@ def virtual_injection_pattern(n, snapshot, normalized=False, per_bus=False,
     if downstream:
         indiag = diag(p_plus)
         offdiag = (p_minus.to_frame().dot(p_plus.to_frame().T)
-                   .div(p_plus.sum())
-                   .pipe(lambda df: df - np.diagflat(np.diag(df))))
+                   .div(p_plus.sum()))
+#                   .pipe(lambda df: df - np.diagflat(np.diag(df)))
     else:
         indiag = diag(p_minus)
         offdiag = (p_plus.to_frame().dot(p_minus.to_frame().T)
-                   .div(p_minus.sum())
-                   .pipe(lambda df: df - np.diagflat(np.diag(df))))
+                   .div(p_minus.sum()))
+#                   .pipe(lambda df: df - np.diagflat(np.diag(df))))
     vip = indiag + offdiag
     if per_bus:
         Q = (vip[indiag.sum() == 0].T
@@ -291,14 +348,15 @@ def virtual_injection_pattern(n, snapshot, normalized=False, per_bus=False,
     else:
         Q = H.dot(vip).round(10).T
         if normalized:
-    #       normalized colorvectors
+            # normalized colorvectors
             Q /= f
         Q = (Q.rename_axis('bus').rename_axis("line", axis=1)
-             .stack().round(8)[lambda ds:ds!=0])
+             .stack().round(8)[lambda ds: ds != 0])
     return pd.concat([Q], keys=[snapshot], names=['snapshots'])
 
 
-def minimal_flow_shares(n, snapshot, **kwargs):
+def optimal_flow_shares(n, snapshot, method='min', downstream=True,
+                        per_bus=False, **kwargs):
     """
 
 
@@ -306,35 +364,115 @@ def minimal_flow_shares(n, snapshot, **kwargs):
     """
     from scipy.optimize import minimize
     H = PTDF(n)
-    #    f = n.lines_t.p0.loc[snapshot]
     p = n.buses_t.p.loc[snapshot]
-    indiag = diag(p*p)
-    offdiag = p.to_frame().dot(p.to_frame().T).clip_upper(0)
-    pp = indiag + offdiag
+    p_plus = p.clip_lower(0)
+    p_minus = p.clip_upper(0)
+    pp = p.to_frame().dot(p.to_frame().T).div(p).fillna(0)
+    if downstream:
+        indiag = diag(p_plus)
+        offdiag = (p_minus.to_frame().dot(p_plus.to_frame().T)
+                   .div(p_plus.sum()))
+        pp = pp.clip_upper(0).add(diag(pp)).mul(np.sign(p.clip_lower(0)))
+        bounds = pd.concat([pp.stack(), pp.stack().clip_lower(0)], axis=1,
+                           keys=['lb', 'ub'])
+
+#                   .pipe(lambda df: df - np.diagflat(np.diag(df)))
+    else:
+        indiag = diag(p_minus)
+        offdiag = (p_plus.to_frame().dot(p_minus.to_frame().T)
+                   .div(p_minus.sum()))
+        pp = pp.clip_lower(0).add(diag(pp)).mul(-np.sign(p.clip_upper(0)))
+        bounds = pd.concat([pp.stack().clip_upper(0), pp.stack()], axis=1,
+                           keys=['lb', 'ub'])
+    x0 = (indiag + offdiag).stack()
     N = len(n.buses)
+    if method == 'min':
+        sign = 1
+    elif method == 'max':
+        sign = -1
 
     def minimization(df):
-        return -((H.dot(df.reshape(N, N)))**2).sum().sum()
+        return sign * (H.dot(df.reshape(N, N)).stack()**2).sum()
+
     constr = [
             #   nodal balancing
-            {'type': 'eq', 'fun': (lambda df: df.reshape(N, N).sum(0))},
+            {'type': 'eq', 'fun': lambda df: df.reshape(N, N).sum(0)},
             #    total injection of colors
-            {'type': 'eq', 'fun': (lambda df: df.reshape(N, N).sum(1)-p)},
-            #   flow conservation
-    #        {'type':'eq', 'fun':(lambda df: H.dot(df.reshape(6,6)).sum(1) - f) }
-                ]
+            {'type': 'eq', 'fun': lambda df: df.reshape(N, N).sum(1)-p.values}
+            ]
 
     #   sources-sinks-fixation
-    bounds = pp.unstack()
-    bounds = pd.concat([bounds.clip_upper(0), bounds.clip_lower(0)], axis=1)
-    bounds[bounds != 0] = None
-
-    sol = minimize(minimization, pp, constraints=constr, bounds=bounds.values,
-                   options={'maxiter': 400}, tol=1e-12, **kwargs)
-    sol = pd.DataFrame(sol.x.reshape(N, N), columns=n.buses.index,
+    res = minimize(minimization, x0, constraints=constr,
+                   bounds=bounds, options={'maxiter': 1000}, tol=1e-5,
+                   method='SLSQP')
+    print(res)
+    sol = pd.DataFrame(res.x.reshape(N, N), columns=n.buses.index,
                        index=n.buses.index).round(10)
-    c = H.dot(sol).round(2)
-    return c
+    if per_bus:
+        return (sol[indiag.sum()==0].T
+                .rename_axis('bus/sink', axis=int(downstream))
+                .rename_axis('bus/source', axis=int(not downstream))
+                .stack()[lambda ds:ds != 0])
+    else:
+        return H.dot(sol).round(8)
+
+
+def zbus_transmission(n, snapshot):
+    '''
+    This allocation builds up on the method presented in [1]. However, we
+    provide for non-linear power flow an additional DC-approximated
+    modification, neglecting the series resistance r for lines.
+
+
+    [1] A. J. Conejo, J. Contreras, D. A. Lima, and A. Padilha-Feltrin,
+        “$Z_{\rm bus}$ Transmission Network Cost Allocation,” IEEE Transactions
+        on Power Systems, vol. 22, no. 1, pp. 342–349, Feb. 2007.
+
+    '''
+    n.calculate_dependent_values()
+    buses = n.buses.index
+    slackbus = n.sub_networks.obj[0].slack_bus
+
+
+    # linearised method, start from linearised admittance matrix
+    Y_diag = diag((1/n.lines.x).groupby(n.lines.bus0).sum()
+                  .reindex(n.buses.index, fill_value=0)) \
+             + diag((1/n.lines.x).groupby(n.lines.bus1).sum()
+                    .reindex(n.buses.index, fill_value=0))
+    Y_offdiag = (1/n.lines.set_index(['bus0', 'bus1']).x
+                 .unstack().reindex(index=buses, columns=buses)).fillna(0)
+    Y = Y_diag - Y_offdiag - Y_offdiag.T
+
+    Z = pd.DataFrame(pinv(Y), buses, buses)
+    # set angle of slackbus to 0
+    Z = Z.add(-Z.loc[slackbus])
+    # DC-approximated S = P
+    S = n.buses_t.p.loc[[snapshot]].T
+    V = n.buses.v_nom.to_frame(snapshot) * n.buses_t.v_ang.T
+    I = Y.dot(V)
+
+    # -------------------------------------------------------------------------
+    # nonlinear method start with full admittance matrix from pypsa
+    n.sub_networks.obj[0].calculate_Y()
+    # Zbus matrix
+#    Y = pd.DataFrame(n.sub_networks.obj[0].Y.todense(), buses, buses)
+#    Z = pd.DataFrame(pinv(Y), buses, buses)
+#    Z = Z.add(-Z.loc[slackbus])
+
+    # -------------------------------------------------------------------------
+
+    # difference in the first term
+    Z_diff = ((Z.reindex(n.lines.bus0) - Z.reindex(n.lines.bus1).values)
+              .set_index(n.lines.bus1, append=True))
+    y_se = (1/(n.lines["r_pu"] + 1.j*n.lines["x_pu"])
+            .set_axis(Z_diff.index, inplace=False))
+    y_sh = ((n.lines["g_pu"] + 1.j*n.lines["b_pu"])
+            .set_axis(Z_diff.index, inplace=False))
+
+    # build electrical distance according to equation (7)
+    A = (Z_diff.mul(y_se, axis=0)
+         + Z.reindex(Z_diff.index.levels[0]).mul(y_sh, axis=0))
+
 
 
 def flow_allocation(n, snapshots, method='Average participation', **kwargs):
@@ -389,6 +527,7 @@ def flow_allocation(n, snapshots, method='Average participation', **kwargs):
     if n.lines_t.p0.shape[0] == 0:
         raise ValueError('Flows are not given by the network, '
                          'please solve the network flows first')
+    n.calculate_dependent_values()
 
     if method in ['Average participation', 'ap']:
         method_func = average_participation
@@ -421,7 +560,8 @@ def chord_diagram(allocation, lower_bound=0, groups=None, size=300,
     It visualizes allocated peer-to-peer flows for all buses given in
     the data. As for compatibility with ipython shell the rendering of
     the image is passed to matplotlib however to the disfavour of
-    interactivity.
+    interactivity. Note that the plot becomes only meaningful for networks
+    with N > 5, because of sparse flows otherwise.
 
 
     [1] http://holoviews.org/reference/elements/bokeh/Chord.html
@@ -446,7 +586,11 @@ def chord_diagram(allocation, lower_bound=0, groups=None, size=300,
     """
 
     import holoviews as hv
+    hv.extension('matplotlib')
     from IPython.display import Image
+
+    if len(allocation.index.levels) == 3:
+        allocation = allocation[allocation.index.levels[0][0]]
 
     allocated_buses = allocation.index.levels[0] \
                       .append(allocation.index.levels[1]).unique()
@@ -457,33 +601,30 @@ def chord_diagram(allocation, lower_bound=0, groups=None, size=300,
         .sort_values('bus/source').reset_index(drop=True) \
         [lambda df: df.value >= lower_bound]
 
-    nodes = pd.DataFrame({'name': bus_map.index})
+    nodes = pd.DataFrame({'bus': bus_map.index})
     if groups is None:
         cindex = 'index'
         ecindex = 'bus/source'
     else:
+        groups = groups.rename(index=bus_map)
         nodes = nodes.assign(groups=groups)
         links = links.assign(groups=links['bus/source']
-                             .map(nodes.data['groups']))
+                             .map(groups))
         cindex = 'groups'
         ecindex = 'groups'
 
     nodes = hv.Dataset(nodes, 'index')
-
     diagram = hv.Chord((links, nodes))
     diagram = diagram.opts(style={'cmap': 'Category20',
                                   'edge_cmap': 'Category20'},
-                           plot={'label_index': 'name',
+                           plot={'label_index': 'bus',
                                  'color_index': cindex,
-                                 'edge_color_index': ecindex})
-
+                                 'edge_color_index': ecindex
+                                 })
     renderer = hv.renderer('matplotlib').instance(fig='png', holomap='gif',
                                                   size=size, dpi=300)
     renderer.save(diagram, 'example_I')
     return Image(filename='example_I.png', width=800, height=800)
-
-
-
 
 
 

@@ -750,7 +750,7 @@ class Network(Basic):
 
     def passive_branches(self):
         return pd.concat((self.df(c) for c in self.passive_branch_components),
-                         keys=self.passive_branch_components)
+                         keys=self.passive_branch_components, sort=False)
 
     def controllable_branches(self):
         return pd.concat((self.df(c) for c in self.controllable_branch_components),
