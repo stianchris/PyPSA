@@ -829,8 +829,11 @@ def define_passive_branch_flows_with_cycles(network,snapshots):
 
 
 
-def define_passive_branch_flows_with_kirchhoff(network,snapshots,skip_vars=False):
+def define_passive_branch_flows_with_kirchhoff(network,snapshots,skip_vars=False,
+                                               model=None):
     """ define passive branch flows with the kirchoff method """
+    if model is None:
+        model = network.model
 
     for sub_network in network.sub_networks.obj:
         find_tree(sub_network)
@@ -844,24 +847,24 @@ def define_passive_branch_flows_with_kirchhoff(network,snapshots,skip_vars=False
     passive_branches = network.passive_branches()
 
     if not skip_vars:
-        network.model.passive_branch_p = Var(list(passive_branches.index), snapshots)
+        model.passive_branch_p = Var(list(passive_branches.index), snapshots)
 
     cycle_index = []
     cycle_constraints = {}
 
     for subnetwork in network.sub_networks.obj:
 
-        branches = subnetwork.branches()
         attribute = "r_pu_eff" if network.sub_networks.at[subnetwork.name,"carrier"] == "DC" else "x_pu_eff"
 
-        sub_network_cycle_index, sub_network_cycle_constraints = define_sub_network_cycle_constraints( subnetwork,
-                                                                                                       snapshots,
-                                                                                                       network.model.passive_branch_p, attribute)
+        sub_network_cycle_index, sub_network_cycle_constraints = \
+            define_sub_network_cycle_constraints(subnetwork, snapshots,
+                                                 model.passive_branch_p,
+                                                 attribute)
 
         cycle_index.extend( sub_network_cycle_index)
         cycle_constraints.update( sub_network_cycle_constraints)
 
-    l_constraint(network.model, "cycle_constraints", cycle_constraints,
+    l_constraint(model, "cycle_constraints", cycle_constraints,
                  cycle_index, snapshots)
 
 def define_passive_branch_constraints(network,snapshots):
@@ -1128,7 +1131,8 @@ def define_linear_objective(network,snapshots):
 
     l_objective(model,objective)
 
-def extract_optimisation_results(network, snapshots, formulation="angles", free_pyomo=True):
+def extract_optimisation_results(network, snapshots, formulation="angles", free_pyomo=True,
+                                 model=None):
 
     if isinstance(snapshots, pd.DatetimeIndex) and _pd_version < '0.18.0':
         # Work around pandas bug #12050 (https://github.com/pydata/pandas/issues/12050)
@@ -1147,7 +1151,8 @@ def extract_optimisation_results(network, snapshots, formulation="angles", free_
     #get value of objective function
     network.objective = network.results["Problem"][0]["Upper bound"]
 
-    model = network.model
+    if model is None:
+        model = network.model
 
     duals = pd.Series(list(model.dual.values()), index=pd.Index(list(model.dual.keys())))
     if free_pyomo:
@@ -1279,17 +1284,17 @@ def extract_optimisation_results(network, snapshots, formulation="angles", free_
     network.generators.p_nom_opt = network.generators.p_nom
 
     network.generators.loc[network.generators.p_nom_extendable, 'p_nom_opt'] = \
-        get_values(network.model.generator_p_nom)
+        get_values(model.generator_p_nom)
 
     network.storage_units.p_nom_opt = network.storage_units.p_nom
 
     network.storage_units.loc[network.storage_units.p_nom_extendable, 'p_nom_opt'] = \
-        get_values(network.model.storage_p_nom)
+        get_values(model.storage_p_nom)
 
     network.stores.e_nom_opt = network.stores.e_nom
 
     network.stores.loc[network.stores.e_nom_extendable, 'e_nom_opt'] = \
-        get_values(network.model.store_e_nom)
+        get_values(model.store_e_nom)
 
 
     s_nom_extendable_passive_branches = get_values(model.passive_branch_s_nom)
@@ -1301,7 +1306,7 @@ def extract_optimisation_results(network, snapshots, formulation="angles", free_
     network.links.p_nom_opt = network.links.p_nom
 
     network.links.loc[network.links.p_nom_extendable, "p_nom_opt"] = \
-        get_values(network.model.link_p_nom)
+        get_values(model.link_p_nom)
 
     try:
         network.global_constraints.loc[:,"mu"] = - get_shadows(model.global_constraints, multiind=False)

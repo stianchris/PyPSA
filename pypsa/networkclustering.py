@@ -145,7 +145,7 @@ def aggregatelines(network, buses, interlines, line_length_factor=1.0):
     positive_order = interlines.bus0_s < interlines.bus1_s
     interlines_p = interlines[positive_order]
     interlines_n = interlines[~ positive_order].rename(columns={"bus0_s":"bus1_s", "bus1_s":"bus0_s"})
-    interlines_c = pd.concat((interlines_p,interlines_n))
+    interlines_c = pd.concat((interlines_p,interlines_n), sort=True)
 
     attrs = network.components["Line"]["attrs"]
     columns = set(attrs.index[attrs.static & attrs.status.str.startswith('Input')]).difference(('name', 'bus0', 'bus1'))
@@ -274,11 +274,11 @@ def get_clustering_from_busmap(network, busmap, with_time=True, line_length_fact
                         .dropna(subset=['bus0', 'bus1'])
                         .loc[lambda df: df.bus0 != df.bus1])
     io.import_components_from_dataframe(network_c, new_links, "Link")
-
     if with_time:
         for attr, df in iteritems(network.links_t):
             if not df.empty:
-                io.import_series_from_dataframe(network_c, df, "Link", attr)
+                io.import_series_from_dataframe(
+                        network_c, df.reindex(columns=new_links.index), "Link", attr)
 
     io.import_components_from_dataframe(network_c, network.carriers, "Carrier")
 

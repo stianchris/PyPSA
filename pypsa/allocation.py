@@ -9,7 +9,7 @@ Created on Wed Feb 21 12:14:49 2018
 # This side-package is created for use as flow and cost allocation.
 
 from .pf import calculate_PTDF
-from numpy.linalg import inv, pinv
+from numpy.linalg import inv
 import pandas as pd
 import numpy as np
 import logging
@@ -17,6 +17,10 @@ logger = logging.getLogger(__name__)
 
 
 # %% utility functions
+
+
+def pinv(df):
+    return pd.DataFrame(np.linalg.pinv(df), df.columns, df.index)
 
 
 def diag(df):
@@ -43,49 +47,69 @@ def incidence_matrix(n, branch_components=['Link', 'Line']):
                  .unstack().reindex(columns=buses).fillna(0)
                  - c.df.assign(K=1).set_index('bus1', append=True)['K']
                  .unstack().reindex(columns=buses).fillna(0)).T)
-    return pd.concat(K, axis=1)
+    return pd.concat(K, keys=branch_components, axis=1)
 
 
-def PTDF(n, slack_bus=False, branch_components={'Line'}):
+def PTDF(n, branch_components={'Line'}, snapshot=None, scale=1.):
+    n.calculate_dependent_values()
     n.lines = n.lines.assign(carrier=n.lines.bus0.map(n.buses.carrier))
     assert (n.lines.carrier == n.lines.bus1.map(n.buses.carrier)).all()
-    if slack_bus:
-        n.determine_n_topology()
-        calculate_PTDF(n.sub_ns.obj[0])
-        return pd.DataFrame(n.sub_ns.obj[0].PTDF,
-                            columns=n.buses.index, index=n.lines.index)
-    else:
-        K = incidence_matrix(n, branch_components)
-        omega = pd.Series()
-        if 'Line' in branch_components:
-            omega = (omega
-                     .append(1/(n.lines.x_pu.where(n.lines.carrier == 'AC', 0)
-                             + n.lines.r_pu.where(n.lines.carrier == 'DC', 0)))
-                     )
-        if 'Link' in branch_components:
-            omega = omega.append(pd.Series(1, n.links.index))
-        Omega = diag(omega)
-        return pd.DataFrame(
-                Omega.dot(K.T).dot(
-                        np.linalg.pinv(K.dot(Omega).dot(K.T))).values,
-                columns=n.buses.index, index=omega.index)
+    K = incidence_matrix(n, branch_components)
+    omega = []
+    for c in branch_components:
+        if c == 'Line':
+            (omega.append(1/(n.lines.x_pu.where(n.lines.carrier == 'AC', 0)
+             + n.lines.r_pu.where(n.lines.carrier == 'DC', 0))))
+        if c == 'Link':
+            if snapshot is None:
+                logger.warn('Link in argument "branch_components", but no '
+                            'snapshot given. Falling back to first snapshot')
+                snapshot = n.snapshots[0]
+            elif isinstance(snapshot, pd.DatetimeIndex):
+                snapshot = snapshot[0]
+            omega.append(n.links_t.p0.loc[snapshot].T *scale)
+    Omega = diag(pd.concat(omega, keys=branch_components))
+    return Omega.dot(K.T).dot(pinv(K.dot(Omega).dot(K.T))), pd.concat(omega, keys=branch_components)
 
 
-def PFDF(n, snapshot):
-    #  ACDC (link and line) network injection
-    p = (pd.concat({c.name:
-         c.pnl.p.multiply(c.df.sign, axis=1)
-         .groupby(c.df.bus, axis=1).sum()
-         for c in n.iterate_components(n.controllable_one_port_components)},
+def network_injection(n, snapshots=None):
+    """
+    Function to determine the total network injection including passive and
+    active branches.
+    """
+    if snapshots is None:
+        snapshots = n.snapshots
+    if isinstance(snapshots, pd.Timestamp):
+        snapshots = [snapshots]
+    return (pd.concat({c.name:
+            c.pnl.p.multiply(c.df.sign, axis=1)
+            .groupby(c.df.bus, axis=1).sum()
+            for c in n.iterate_components(n.controllable_one_port_components)},
             sort=True)
-         .sum(level=1)
-         .reindex(index=[snapshot],
-                  columns=n.buses_t.p.columns,
-                  fill_value=0.)).T
+            .sum(level=1)
+            .reindex(index=snapshots, columns=n.buses_t.p.columns,
+                     fill_value=0)).T
 
-    f = pd.concat([n.lines_t.p0.loc[[snapshot]], n.links_t.p0.loc[[snapshot]]],
-                  axis=1)
-    return p.dot(1/len(f)/f)
+
+#def PFDF(n, snapshot):
+    #  ACDC (link and line) network injection
+
+    #Test 1
+#    p = (pd.concat({c.name:
+#         c.pnl.p.multiply(c.df.sign, axis=1)
+#         .groupby(c.df.bus, axis=1).sum()
+#         for c in n.iterate_components(n.controllable_one_port_components)},
+#            sort=True)
+#         .sum(level=1)
+#         .reindex(index=[snapshot],
+#                  columns=n.buses_t.p.columns,
+#                  fill_value=0.)).T
+#
+#    f = pd.concat([n.lines_t.p0.loc[[snapshot]], n.links_t.p0.loc[[snapshot]]],
+#                  axis=1)
+#    return p.dot(1/len(f)/f)
+
+    # Test 2
 #    n.determine_network_topology()
 #    H = []
 #    carrier = []
@@ -100,7 +124,6 @@ def PFDF(n, snapshot):
 #                              sub.buses().index))
 #    return pd.concat(H, keys=carrier, sort=False,
 #                     names=['subnet', 'lines']).fillna(0)
-
 
 
 
@@ -472,6 +495,51 @@ def zbus_transmission(n, snapshot):
     # build electrical distance according to equation (7)
     A = (Z_diff.mul(y_se, axis=0)
          + Z.reindex(Z_diff.index.levels[0]).mul(y_sh, axis=0))
+
+
+def marginal_welfare_contribution(n, snapshots=None, formulation='kirchhoff'):
+    import pyomo.environ as pe
+    from .opf import (extract_optimisation_results,
+                      define_passive_branch_flows_with_kirchhoff)
+
+
+    if snapshots is None:
+        snapshots = n.snapshots
+    n.lopf(snapshots, solver_name='gurobi_persistent', formulation=formulation)
+    m = n.model
+    full_result = n.opt.results
+    networks = {}
+    for line in n.lines.index:
+        m.solutions.load_from(full_result)
+        n_temp = n.copy()
+        n_temp.mremove('Line', [line])
+
+        # remove line from persistent solver
+        map(n.opt.remove_var, m.passive_branch_p['Line', line, :])
+        # remove cycle constraint from persistent solver
+        map(n.opt.remove_constraint, m.cycle_constraints)
+
+        # remove cycle constraint from model
+        for c in dir(n.model):
+            if 'cycle_constraint' in c:
+                n.model.del_component(c)
+        # add new cycle constraint to model
+        define_passive_branch_flows_with_kirchhoff(n_temp, snapshots, model=m,
+                                                   skip_vars=True)
+        # add cycle constraint to persistent solver
+        map(n.opt.add_constraint, m.cycle_constraints)
+
+        # solve
+        n_temp.results = n.opt.solve()
+
+        # extract results
+        extract_optimisation_results(n_temp, snapshots,
+                                     formulation='kirchhoff', model=m)
+        networks[line] = n_temp
+        map(n.opt.add_var, m.passive_branch_p['Line', line, :])
+
+    return networks
+
 
 
 

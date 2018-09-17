@@ -58,8 +58,8 @@ except:
         pltly_present = False
 
 
-def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='b',
-         line_colors='g', bus_sizes=10, flow=None, line_widths=2, title="",
+def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='grey',
+         line_colors=None, bus_sizes=10, flow=None, line_widths=1, title="",
          line_cmap=None, bus_cmap=None, boundaries=None,
          geometry=False, branch_components=['Line', 'Link'], jitter=None):
     """
@@ -85,6 +85,11 @@ def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='b',
         Widths of lines, defaults to 2. Widths for branches other
         than Lines can be specified using a pandas Series with a
         MultiIndex.
+    flow : snapshot/pandas.Series
+        Flow to be displayed in the plot, defaults to None. If an element of
+        network.snapshots is given, the flow at this timestamp will be
+        displayed. Other flows can be specified by passing a pandas Serie with
+        a MultiIndex.
     title : string
         Graph title
     line_cmap : plt.cm.ColorMap/str|dict
@@ -107,10 +112,14 @@ def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='b',
     """
 
     defaults_for_branches = {
-        'Link': dict(color="cyan", width=2),
-        'Line': dict(color="b", width=2),
-        'Transformer': dict(color='green', width=2)
+        'Link': dict(color="royalblue", width=1),
+        'Line': dict(color="orange", width=1),
+        'Transformer': dict(color='green', width=1)
     }
+    if line_colors is None:
+        line_colors = (pd.Series( defaults_for_branches)
+                       .apply(pd.Series).loc[['Line','Link'], 'color']
+                       .to_dict())
 
     if not plt_present:
         logger.error("Matplotlib is not present, so plotting won't work.")
@@ -144,8 +153,8 @@ def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='b',
         bmap = Basemap(resolution=resolution, epsg=network.srid,
                        llcrnrlat=y1, urcrnrlat=y2, llcrnrlon=x1,
                        urcrnrlon=x2, ax=ax)
-        bmap.drawcountries()
-        bmap.drawcoastlines()
+        bmap.drawcountries(linewidth=0.3, zorder=-1)
+        bmap.drawcoastlines(linewidth=0.4, zorder=-1)
 
         x, y = bmap(x.values, y.values)
         x = pd.Series(x, network.buses.index)
@@ -189,32 +198,37 @@ def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='b',
         elif isinstance(ser, pd.Series):
             if isinstance(ser.index, pd.MultiIndex):
                 return ser
-            index = ser.index
-            ser = ser.values
+            else:
+                return pd.concat([ser.reindex(network.lines.index),
+                                 ser.reindex(network.links.index)],
+                                 keys=['Line', 'Link'], sort=True)
         else:
-            index = network.lines.index
-        return pd.Series(ser,
-                         index=pd.MultiIndex(levels=(["Line"], index),
-                                             labels=(np.zeros(len(index)),
-                                                     np.arange(len(index)))))
+            index = pd.concat([network.lines, network.links],
+                          keys=['Line', 'Link'], sort=True).index
+            return pd.Series(ser, index)
 
     branch_collections = []
-    
+
     line_colors = as_branch_series(line_colors)
-    if flow is None:    
+    if flow is None:
         line_widths = as_branch_series(line_widths)
     else:
+        if flow in network.snapshots:
+            flow = pd.concat([network.lines_t.p0.loc[flow],
+                          network.links_t.p0.loc[flow]], keys=['Line', 'Link'])
+
         # take line_widths as argument for scaling the arrows and linewidths
         assert ~(isinstance(line_widths, float) | isinstance(line_widths, int)
                 | line_widths is None), """Setting flow and line_widths for each branch
-                is not possible. For a given flow, the argument line_widths 
+                is not possible. For a given flow, the argument line_widths
                 is restricted to a scaling factor only"""
         # set a rough estimate of the linescales which scales the size of the arrows
         # and lines for the default line_widths=2
         flow_scale = (len(network.lines)+100)**1.7 * 2./line_widths
-        arrows = directed_flow(network, flow, ax=ax, flow_scale=flow_scale)
+        arrows = directed_flow(network, flow, ax=ax, flow_scale=flow_scale,
+                               line_colors=line_colors)
         branch_collections.append(arrows)
-        line_widths = as_branch_series(flow/flow_scale)
+        line_widths = as_branch_series(flow)/flow_scale
     if not isinstance(line_cmap, dict):
         line_cmap = {'Line': line_cmap}
 
@@ -253,6 +267,11 @@ def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='b',
                                       colors=l_colors,
                                       transOffset=ax.transData)
 
+#        if annotate:
+#            for line in c.df.index:
+#                ax.annotate(line, ((x0[line]+x1[line])/2.,
+#                                   (y0[line]+y1[line])/2.), size='small')
+
         if l_nums is not None:
             l_collection.set_array(np.asarray(l_nums))
             l_collection.set_cmap(line_cmap.get(c.name, None))
@@ -267,6 +286,7 @@ def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='b',
 
     ax.update_datalim(compute_bbox_with_margins(margin, x, y))
     ax.autoscale_view()
+    ax.axis('off')
 
     ax.set_title(title)
 
@@ -282,10 +302,11 @@ def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='b',
 #inspired the breakout group and for contributing ideas to the iplot
 #function below.
 
-def iplot(network, fig=None, bus_colors='blue',
+def iplot(network, fig=None, bus_colors='grey',
           bus_colorscale=None, bus_colorbar=None, bus_sizes=10, bus_text=None,
-          line_colors='green', line_widths=2, line_text=None, title="",
-          branch_components=['Line', 'Link'], iplot=True, jitter=None):
+          line_colors=None, line_widths=2, line_text=None, title="",
+          geoscope='europe', branch_components=['Line', 'Link'], iplot=True,
+          jitter=None):
     """
     Plot the network buses and lines interactively using plotly.
 
@@ -331,10 +352,15 @@ def iplot(network, fig=None, bus_colors='blue',
     """
 
     defaults_for_branches = {
-        'Link': dict(color="cyan", width=2),
-        'Line': dict(color="blue", width=2),
+        'Link': dict(color="royalblue", width=2),
+        'Line': dict(color="orange", width=2),
         'Transformer': dict(color='green', width=2)
     }
+    if line_colors is None:
+        line_colors = (pd.Series( defaults_for_branches)
+                       .apply(pd.Series).loc[['Line','Link'], 'color']
+                       .to_dict())
+
 
     if fig is None:
         fig = dict(data=[],layout={})
@@ -349,13 +375,13 @@ def iplot(network, fig=None, bus_colors='blue',
         x = x + np.random.uniform(low=-jitter, high=jitter, size=len(x))
         y = y + np.random.uniform(low=-jitter, high=jitter, size=len(y))
 
-    bus_trace = dict(x=x, y=y,
+    bus_trace = dict(lon=x, lat=y,
                      text=bus_text,
-                     type="scatter",
+                     type="scattergeo",
                      mode="markers",
                      hoverinfo="text",
                      marker=dict(color=bus_colors,
-                                 size=bus_sizes),
+                                 size=bus_sizes)
                      )
 
     if bus_colorscale is not None:
@@ -418,30 +444,40 @@ def iplot(network, fig=None, bus_colors='blue',
             color = l_colors if isinstance(l_colors, string_types) else l_colors[line]
             width = l_widths if isinstance(l_widths, (int, float)) else l_widths[line]
 
-            shapes.append(dict(type='line',
-                               x0=x0[line],
-                               y0=y0[line],
-                               x1=x1[line],
-                               y1=y1[line],
+
+            shapes.append(dict(type='scattergeo',
+                               mode='lines',
+                               lon=[x0[line], x1[line]],
+                               lat=[y0[line], y1[line]],
+#                               x0=x0[line],
+#                               y0=y0[line],
+#                               x1=x1[line],
+#                               y1=y1[line],
                                opacity=0.7,
                                line=dict(color=color, width=width)))
 
-        shape_traces.append(dict(x=0.5*(x0+x1),
-                                 y=0.5*(y0+y1),
+
+        shape_traces.append(dict(lon=0.5*(x0+x1),
+                                 lat=0.5*(y0+y1),
                                  text=l_text,
-                                 type="scatter",
+                                 type="scattergeo",
                                  mode="markers",
                                  hoverinfo="text",
                                  marker=dict(opacity=0.)))
 
-    fig['data'].extend([bus_trace]+shape_traces)
+    fig['data'].extend(shapes+shape_traces+[bus_trace])
 
-    fig['layout'].update(dict(shapes=shapes,
-                              title=title,
+    fig['layout'].update(dict(title=title,
                               hovermode='closest',
-                              showlegend=False))
-                              #xaxis=dict(range=[6,14]),
-                              #yaxis=dict(range=[47,55])
+                              showlegend=False,
+                              geo = dict(
+                                scope=geoscope,
+                                projection=dict( type='azimuthal equal area' ),
+                                showland = True,
+                                landcolor = 'rgb(243, 243, 243)',
+                                countrycolor = 'rgb(204, 204, 204)',
+                                )
+                              ))
 
 
     if iplot:
@@ -454,53 +490,64 @@ def iplot(network, fig=None, bus_colors='blue',
 
 
 
-def directed_flow(network, flow, flow_scale=None, ax=None):
+def directed_flow(n, flow, flow_scale=None, ax=None, line_colors='darkgreen'):
 #    this funtion is used for diplaying arrows representing the network flow
     from matplotlib.patches import FancyArrow
+    if flow_scale is None:
+        flow_scale = 1
     if ax is None:
         ax = plt.gca()
 #    set the scale of the arrowsizes
-    linecoords = pd.DataFrame({'x1':network.lines.bus0.map(network.buses.x), 
-                           'y1':network.lines.bus0.map(network.buses.y),
-                           'x2':network.lines.bus1.map(network.buses.x),
-                           'y2':network.lines.bus1.map(network.buses.y),    
-                            #make area not width proportional to flow
-                           'arrowsize': flow.abs()
-                                        .pipe(lambda ds: np.sqrt(ds/flow_scale))
-                                        .clip(lower=1e-8), 
-                           'direction': np.sign(flow)})
-    linecoords['linelength'] = (np.sqrt((linecoords.x1-linecoords.x2)**2.+
-                                        (linecoords.y1 - linecoords.y2)**2))
-    linecoords['arrowtolarge'] = (1.5 * linecoords.arrowsize 
-                                            > linecoords.loc[:, 'linelength'])
+    arrowsize = (flow.abs()
+                .pipe(lambda ds: np.sqrt(ds/flow_scale))
+                .clip(lower=1e-8))
+    fdata = pd.concat(
+            [pd.DataFrame({'x1': getattr(n, l).bus0.map(n.buses.x),
+                          'y1': getattr(n, l).bus0.map(n.buses.y),
+                          'x2': getattr(n, l).bus1.map(n.buses.x),
+                          'y2': getattr(n, l).bus1.map(n.buses.y),
+                          # make area not width proportional to flow
+                          'arrowsize': arrowsize.loc[l[:-1].capitalize()]
+                          .reindex((getattr(n, l).index)),
+                          'direction': np.sign(flow).loc[l[:-1].capitalize()]
+                          .reindex((getattr(n, l).index))})
+            for l in ['lines', 'links']],
+            keys=['Line', 'Link'])
+    fdata['linelength'] = (np.sqrt((fdata.x1-fdata.x2)**2.+
+                                        (fdata.y1 - fdata.y2)**2))
+    fdata['arrowtolarge'] = (1.5 * fdata.arrowsize
+                                            > fdata.loc[:, 'linelength'])
 
     #swap coords for negativ directions
-    linecoords.loc[linecoords.direction==-1., ['x1', 'x2', 'y1', 'y2']] = (
-        linecoords.loc[linecoords.direction==-1., ['x2', 'x1', 'y2', 'y1']].values)
-    
-    linecoords['arrows'] = (
-            linecoords[(linecoords.linelength>0.)&(~linecoords.arrowtolarge)]
-                .apply(lambda ds: 
-                    FancyArrow(ds.x1, ds.y1, 
+    fdata.loc[fdata.direction==-1., ['x1', 'x2', 'y1', 'y2']] = (
+        fdata.loc[fdata.direction==-1., ['x2', 'x1', 'y2', 'y1']].values)
+
+    fdata['arrows'] = (
+            fdata[(fdata.linelength>0.)&(~fdata.arrowtolarge)]
+                .apply(lambda ds:
+                    FancyArrow(ds.x1, ds.y1,
                                0.6*(ds.x2 - ds.x1)-ds.arrowsize
                                    *0.75*(ds.x2 - ds.x1)/ds.linelength,
                                0.6*(ds.y2 - ds.y1)-ds.arrowsize
                                    *0.75*(ds.y2 - ds.y1)/ds.linelength,
                                head_width=ds.arrowsize
                                ), axis=1) )
-    linecoords.loc[(linecoords.linelength>0.)&(linecoords.arrowtolarge), 'arrows']= ( 
-            linecoords[(linecoords.linelength>0.)&(linecoords.arrowtolarge)]
-                .apply(lambda ds: 
-                    FancyArrow(ds.x1, ds.y1, 
+    fdata.loc[(fdata.linelength>0.)&(fdata.arrowtolarge), 'arrows']= (
+            fdata[(fdata.linelength>0.)&(fdata.arrowtolarge)]
+                .apply(lambda ds:
+                    FancyArrow(ds.x1, ds.y1,
                                0.001*(ds.x2 - ds.x1),
                                0.001*(ds.y2 - ds.y1),
                                head_width=ds.arrowsize
-                               ), axis=1) ) 
-    arrowcol = PatchCollection(linecoords[linecoords.arrows.notnull()].arrows, 
-                              color='darkgreen',
+                               ), axis=1) )
+    if not isinstance(line_colors.index, pd.MultiIndex):
+        line_colors = (line_colors.reindex(fdata.index.get_level_values(0))
+                        .set_axis(fdata.index, inplace=False))
+    fdata = fdata.assign(color=line_colors)
+    arrowcol = PatchCollection(fdata[fdata.arrows.notnull()].arrows,
+                              color=fdata.color,
                               edgecolors='k',
-                              linewidths=0., 
+                              linewidths=0.,
                               zorder=2, alpha=1)
     ax.add_collection(arrowcol)
-    
     return arrowcol
