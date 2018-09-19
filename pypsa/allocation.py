@@ -91,42 +91,14 @@ def network_injection(n, snapshots=None):
                      fill_value=0)).T
 
 
-#def PFDF(n, snapshot):
-    #  ACDC (link and line) network injection
-
-    #Test 1
-#    p = (pd.concat({c.name:
-#         c.pnl.p.multiply(c.df.sign, axis=1)
-#         .groupby(c.df.bus, axis=1).sum()
-#         for c in n.iterate_components(n.controllable_one_port_components)},
-#            sort=True)
-#         .sum(level=1)
-#         .reindex(index=[snapshot],
-#                  columns=n.buses_t.p.columns,
-#                  fill_value=0.)).T
-#
-#    f = pd.concat([n.lines_t.p0.loc[[snapshot]], n.links_t.p0.loc[[snapshot]]],
-#                  axis=1)
-#    return p.dot(1/len(f)/f)
-
-    # Test 2
-#    n.determine_network_topology()
-#    H = []
-#    carrier = []
-#    for i in n.sub_networks.index:
-#        sub = n.sub_networks.at[i, 'obj']
-#        if sub.buses().shape[0] == 1:
-#            continue
-#        carrier.append(i)
-#        sub.calculate_PTDF()
-#        H.append(pd.DataFrame(sub.PTDF,
-#                              sub.branches().loc['Line'].index,
-#                              sub.buses().index))
-#    return pd.concat(H, keys=carrier, sort=False,
-#                     names=['subnet', 'lines']).fillna(0)
-
-
-
+def is_balanced(n, tol=1e-9):
+    """
+    Helper function to double check whether network flow is balanced
+    """
+    K = incidence_matrix(n)
+    F = pd.concat([n.lines_t.p0, n.links_t.p0], axis=1,
+                  keys=['Line', 'Link']).T
+    return (K @ F).sum(0).max() < tol
 
 #%%
 
@@ -497,49 +469,77 @@ def zbus_transmission(n, snapshot):
          + Z.reindex(Z_diff.index.levels[0]).mul(y_sh, axis=0))
 
 
-def marginal_welfare_contribution(n, snapshots=None, formulation='kirchhoff'):
+def marginal_welfare_contribution(n, snapshots=None, formulation='kirchhoff',
+                                  return_networks=False):
     import pyomo.environ as pe
     from .opf import (extract_optimisation_results,
                       define_passive_branch_flows_with_kirchhoff)
+    def fmap(f, iterable):
+        # mapper for inplace functions
+        for x in iterable:
+            f(x)
 
+    def profit_by_gen(n):
+        price_by_generator = (n.buses_t.marginal_price
+                              .reindex(columns=n.generators.bus)
+                              .set_axis(n.generators.index, axis=1,
+                                        inplace=False))
+        revenue = price_by_generator * n.generators_t.p
+        cost = n.generators_t.p.multiply(n.generators.marginal_cost, axis=1)
+        return ((revenue - cost).rename_axis('profit')
+                .rename_axis('generator', axis=1))
 
     if snapshots is None:
         snapshots = n.snapshots
     n.lopf(snapshots, solver_name='gurobi_persistent', formulation=formulation)
     m = n.model
-    full_result = n.opt.results
+
     networks = {}
+    networks['orig_model'] = n if return_networks else profit_by_gen(n)
+
+    m.zero_flow_con = pe.ConstraintList()
+
     for line in n.lines.index:
-        m.solutions.load_from(full_result)
+#        m.solutions.load_from(n.results)
         n_temp = n.copy()
+        n_temp.model = m
         n_temp.mremove('Line', [line])
 
-        # remove line from persistent solver
-        map(n.opt.remove_var, m.passive_branch_p['Line', line, :])
+        # set line flow to zero
+        line_var = m.passive_branch_p['Line', line, :]
+        fmap(lambda ln: m.zero_flow_con.add(ln == 0), line_var)
+
+        fmap(n.opt.add_constraint, m.zero_flow_con.values())
+
         # remove cycle constraint from persistent solver
-        map(n.opt.remove_constraint, m.cycle_constraints)
+        fmap(n.opt.remove_constraint, m.cycle_constraints.values())
 
         # remove cycle constraint from model
-        for c in dir(n.model):
-            if 'cycle_constraint' in c:
-                n.model.del_component(c)
+        fmap(m.del_component, [c for c in dir(m) if 'cycle_constr' in c])
         # add new cycle constraint to model
-        define_passive_branch_flows_with_kirchhoff(n_temp, snapshots, model=m,
-                                                   skip_vars=True)
+        define_passive_branch_flows_with_kirchhoff(n_temp, snapshots, True)
         # add cycle constraint to persistent solver
-        map(n.opt.add_constraint, m.cycle_constraints)
+        fmap(n.opt.add_constraint, m.cycle_constraints.values())
 
         # solve
         n_temp.results = n.opt.solve()
+        m.solutions.load_from(n_temp.results)
 
         # extract results
         extract_optimisation_results(n_temp, snapshots,
-                                     formulation='kirchhoff', model=m)
+                                     formulation='kirchhoff')
+
+        if not return_networks:
+            n_temp = profit_by_gen(n_temp)
         networks[line] = n_temp
-        map(n.opt.add_var, m.passive_branch_p['Line', line, :])
 
-    return networks
+        # reset model
+        fmap(n.opt.remove_constraint, m.zero_flow_con.values())
+        m.zero_flow_con.clear()
 
+    return (pd.Series(networks)
+            .rename_axis('removed line')
+            .rename('Network'))
 
 
 

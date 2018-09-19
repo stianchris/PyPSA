@@ -85,11 +85,13 @@ def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='grey',
         Widths of lines, defaults to 2. Widths for branches other
         than Lines can be specified using a pandas Series with a
         MultiIndex.
-    flow : snapshot/pandas.Series
+    flow : snapshot/pandas.Series/function/string
         Flow to be displayed in the plot, defaults to None. If an element of
         network.snapshots is given, the flow at this timestamp will be
-        displayed. Other flows can be specified by passing a pandas Serie with
-        a MultiIndex.
+        displayed. If an aggregation function is given, is will be applied
+        to the total network flow via pandas.DataFrame.agg (accepts also
+        function names). Otherwise flows can be specified by passing a pandas
+        Series with MultiIndex.
     title : string
         Graph title
     line_cmap : plt.cm.ColorMap/str|dict
@@ -216,7 +218,9 @@ def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='grey',
         if flow in network.snapshots:
             flow = pd.concat([network.lines_t.p0.loc[flow],
                           network.links_t.p0.loc[flow]], keys=['Line', 'Link'])
-
+        elif isinstance(flow, str) or callable(flow):
+            flow = pd.concat([network.lines_t.p0, network.links_t.p0], axis=1,
+                            keys=['Line', 'Link']).agg(flow, axis=0)
         # take line_widths as argument for scaling the arrows and linewidths
         assert ~(isinstance(line_widths, float) | isinstance(line_widths, int)
                 | line_widths is None), """Setting flow and line_widths for each branch
@@ -224,7 +228,7 @@ def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='grey',
                 is restricted to a scaling factor only"""
         # set a rough estimate of the linescales which scales the size of the arrows
         # and lines for the default line_widths=2
-        flow_scale = (len(network.lines)+100)**1.7 * 2./line_widths
+        flow_scale = (len(network.lines)+100)**1.7 /line_widths
         arrows = directed_flow(network, flow, ax=ax, flow_scale=flow_scale,
                                line_colors=line_colors)
         branch_collections.append(arrows)
@@ -500,7 +504,7 @@ def directed_flow(n, flow, flow_scale=None, ax=None, line_colors='darkgreen'):
 #    set the scale of the arrowsizes
     arrowsize = (flow.abs()
                 .pipe(lambda ds: np.sqrt(ds/flow_scale))
-                .clip(lower=1e-8))
+                .clip(lower=1e-8))/2
     fdata = pd.concat(
             [pd.DataFrame({'x1': getattr(n, l).bus0.map(n.buses.x),
                           'y1': getattr(n, l).bus0.map(n.buses.y),

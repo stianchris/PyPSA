@@ -829,11 +829,10 @@ def define_passive_branch_flows_with_cycles(network,snapshots):
 
 
 
-def define_passive_branch_flows_with_kirchhoff(network,snapshots,skip_vars=False,
-                                               model=None):
+def define_passive_branch_flows_with_kirchhoff(network,snapshots,skip_vars=False):
     """ define passive branch flows with the kirchoff method """
-    if model is None:
-        model = network.model
+
+    model = network.model
 
     for sub_network in network.sub_networks.obj:
         find_tree(sub_network)
@@ -1131,8 +1130,7 @@ def define_linear_objective(network,snapshots):
 
     l_objective(model,objective)
 
-def extract_optimisation_results(network, snapshots, formulation="angles", free_pyomo=True,
-                                 model=None):
+def extract_optimisation_results(network, snapshots, formulation="angles", free_pyomo=True):
 
     if isinstance(snapshots, pd.DatetimeIndex) and _pd_version < '0.18.0':
         # Work around pandas bug #12050 (https://github.com/pydata/pandas/issues/12050)
@@ -1151,8 +1149,7 @@ def extract_optimisation_results(network, snapshots, formulation="angles", free_
     #get value of objective function
     network.objective = network.results["Problem"][0]["Upper bound"]
 
-    if model is None:
-        model = network.model
+    model = network.model
 
     duals = pd.Series(list(model.dual.values()), index=pd.Index(list(model.dual.keys())))
     if free_pyomo:
