@@ -98,7 +98,7 @@ def is_balanced(n, tol=1e-9):
     K = incidence_matrix(n)
     F = pd.concat([n.lines_t.p0, n.links_t.p0], axis=1,
                   keys=['Line', 'Link']).T
-    return (K @ F).sum(0).max() < tol
+    return (K.dotF).sum(0).max() < tol
 
 #%%
 

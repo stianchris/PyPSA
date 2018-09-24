@@ -51,6 +51,14 @@ except:
     basemap_present = False
 
 
+cartopy_present = True
+try:
+    import cartopy
+    import cartopy.crs as ccrs
+except:
+    cartopy_present = False
+
+
 pltly_present = True
 try:
         import plotly.offline as pltly
@@ -59,9 +67,10 @@ except:
 
 
 def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='grey',
-         line_colors=None, bus_sizes=10, flow=None, line_widths=1, title="",
-         line_cmap=None, bus_cmap=None, boundaries=None,
-         geometry=False, branch_components=['Line', 'Link'], jitter=None):
+         line_colors=None, bus_sizes=10, flow=None, generation=None,
+         line_widths=1, title="", line_cmap=None, bus_cmap=None,
+         boundaries=None, geometry=False,
+         branch_components=['Line', 'Link'], jitter=None):
     """
     Plot the network buses and lines using matplotlib and Basemap.
 
@@ -128,47 +137,84 @@ def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='grey',
         return
 
     if ax is None:
-        ax = plt.gca()
-
-    def compute_bbox_with_margins(margin, x, y):
-        #set margins
-        pos = np.asarray((x, y))
-        minxy, maxxy = pos.min(axis=1), pos.max(axis=1)
-        xy1 = minxy - margin*(maxxy - minxy)
-        xy2 = maxxy + margin*(maxxy - minxy)
-        return tuple(xy1), tuple(xy2)
-
-    x = network.buses["x"]
-    y = network.buses["y"]
-
-    if jitter is not None:
-        x = x + np.random.uniform(low=-jitter, high=jitter, size=len(x))
-        y = y + np.random.uniform(low=-jitter, high=jitter, size=len(y))
-
-    if basemap and basemap_present:
-        resolution = 'l' if isinstance(basemap, bool) else basemap
-
-        if boundaries is None:
-            (x1, y1), (x2, y2) = compute_bbox_with_margins(margin, x, y)
+        if cartopy_present and basemap:
+            ax = plt.gca(projection=ccrs.PlateCarree())
         else:
-            x1, x2, y1, y2 = boundaries
-        bmap = Basemap(resolution=resolution, epsg=network.srid,
-                       llcrnrlat=y1, urcrnrlat=y2, llcrnrlon=x1,
-                       urcrnrlon=x2, ax=ax)
-        bmap.drawcountries(linewidth=0.3, zorder=-1)
-        bmap.drawcoastlines(linewidth=0.4, zorder=-1)
+            ax = plt.gca()
 
-        x, y = bmap(x.values, y.values)
-        x = pd.Series(x, network.buses.index)
-        y = pd.Series(y, network.buses.index)
+
+#    def compute_bbox_with_margins(margin, x, y):
+#        #set margins
+#        pos = np.asarray((x, y))
+#        minxy, maxxy = pos.min(axis=1), pos.max(axis=1)
+#        xy1 = minxy - margin*(maxxy - minxy)
+#        xy2 = maxxy + margin*(maxxy - minxy)
+#        return tuple(xy1), tuple(xy2)
+#
+#    x = network.buses["x"]
+#    y = network.buses["y"]
+#
+#    if jitter is not None:
+#        x = x + np.random.uniform(low=-jitter, high=jitter, size=len(x))
+#        y = y + np.random.uniform(low=-jitter, high=jitter, size=len(y))
+#
+#    if basemap and basemap_present:
+#        resolution = 'l' if isinstance(basemap, bool) else basemap
+#
+#        if boundaries is None:
+#            (x1, y1), (x2, y2) = compute_bbox_with_margins(margin, x, y)
+#        else:
+#            x1, x2, y1, y2 = boundaries
+#        bmap = Basemap(resolution=resolution, epsg=network.srid,
+#                       llcrnrlat=y1, urcrnrlat=y2, llcrnrlon=x1,
+#                       urcrnrlon=x2, ax=ax)
+#        bmap.drawcountries(linewidth=0.3, zorder=-1)
+#        bmap.drawcoastlines(linewidth=0.4, zorder=-1)
+#
+#        x, y = bmap(x.values, y.values)
+#        x = pd.Series(x, network.buses.index)
+#        y = pd.Series(y, network.buses.index)
+#
+    if basemap:
+        x, y = draw_map(network, jitter, ax, boundaries, margin, basemap)
+
+    if isinstance(generation, str) or callable(generation):
+        bus_sizes = (network.generators
+                     .assign(sizes = network.generators_t.p.agg(generation))
+                     .groupby(['bus' , 'carrier'])['sizes'].sum()
+                     [lambda ds: ds>0] * bus_sizes / 1e3)
+    elif generation in network.snapshots:
+        bus_sizes = (network.generators
+                     .assign(sizes = network.generators_t.p.loc[generation])
+                     .groupby(['bus' , 'carrier'])['sizes'].sum()
+                     [lambda ds: ds>0] * bus_sizes / 1e3)
+
 
     if isinstance(bus_sizes, pd.Series) and isinstance(bus_sizes.index, pd.MultiIndex):
         # We are drawing pies to show all the different shares
         assert len(bus_sizes.index.levels[0].difference(network.buses.index)) == 0, \
             "The first MultiIndex level of bus_sizes must contain buses"
-        assert isinstance(bus_colors, dict) and set(bus_colors).issuperset(bus_sizes.index.levels[1]), \
-            "bus_colors must be a dictionary defining a color for each element " \
-            "in the second MultiIndex level of bus_sizes"
+        bus_colors = pd.Series(bus_colors).reindex(bus_sizes.index.levels[1])
+
+        #make sure that all carriers get colors
+        if bus_colors.isnull().any():
+            from matplotlib.colors import cnames
+            missing_colors_i = bus_colors[bus_colors.isnull()].index
+            missing_colors = pd.Series(
+                    pd.Series(cnames).sample(len(missing_colors_i)).index,
+                    index=missing_colors_i)
+            bus_colors = bus_colors.append(missing_colors).dropna()
+            logger.warning("Colors for carriers {} not defined, setting"
+                           " them randomly to: {}"
+                           .format(list(missing_colors_i), missing_colors.to_dict()))
+#            if legend:
+            from matplotlib.lines import Line2D
+            handles = bus_colors.apply(lambda x:
+                Line2D([], [], color=x, marker='.', linestyle='None',
+                          markersize=20)).tolist()
+            print(handles)
+            ax.legend(handles=handles, labels=bus_colors.index.tolist(),
+                      loc=2, frameon=True, framealpha=0.2)
 
         bus_sizes = bus_sizes.sort_index(level=0, sort_remaining=False)
 
@@ -271,11 +317,6 @@ def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='grey',
                                       colors=l_colors,
                                       transOffset=ax.transData)
 
-#        if annotate:
-#            for line in c.df.index:
-#                ax.annotate(line, ((x0[line]+x1[line])/2.,
-#                                   (y0[line]+y1[line])/2.), size='small')
-
         if l_nums is not None:
             l_collection.set_array(np.asarray(l_nums))
             l_collection.set_cmap(line_cmap.get(c.name, None))
@@ -290,14 +331,70 @@ def plot(network, margin=0.05, ax=None, basemap=True, bus_colors='grey',
 
     ax.update_datalim(compute_bbox_with_margins(margin, x, y))
     ax.autoscale_view()
-    ax.axis('off')
+    if basemap_present:
+        ax.axis('off')
+    if cartopy_present:
+        ax.outline_patch.set_visible(False)
 
     ax.set_title(title)
 
     return (bus_collection,) + tuple(branch_collections)
 
 
-#This function was borne out of a breakout group at the October 2017
+def compute_bbox_with_margins(margin, x, y):
+    #set margins
+    pos = np.asarray((x, y))
+    minxy, maxxy = pos.min(axis=1), pos.max(axis=1)
+    xy1 = minxy - margin*(maxxy - minxy)
+    xy2 = maxxy + margin*(maxxy - minxy)
+    return tuple(xy1), tuple(xy2)
+
+
+
+def draw_map(network=None, jitter=None, ax=None, boundaries=None,
+             margin=0.05, basemap=True):
+
+    x = network.buses["x"]
+    y = network.buses["y"]
+
+    if jitter is not None:
+        x = x + np.random.uniform(low=-jitter, high=jitter, size=len(x))
+        y = y + np.random.uniform(low=-jitter, high=jitter, size=len(y))
+
+
+
+    if boundaries is None:
+        (x1, y1), (x2, y2) = compute_bbox_with_margins(margin, x, y)
+    else:
+        x1, x2, y1, y2 = boundaries
+
+    if basemap_present:
+        resolution = 'l' if isinstance(basemap, bool) else basemap
+        bmap = Basemap(resolution=resolution, epsg=network.srid,
+                       llcrnrlat=y1, urcrnrlat=y2, llcrnrlon=x1,
+                       urcrnrlon=x2, ax=ax)
+        bmap.drawcountries(linewidth=0.3, zorder=-1)
+        bmap.drawcoastlines(linewidth=0.4, zorder=-1)
+
+        x, y = bmap(x.values, y.values)
+        x = pd.Series(x, network.buses.index)
+        y = pd.Series(y, network.buses.index)
+
+    if cartopy_present:
+        resolution = '50m' if isinstance(basemap, bool) else basemap
+        assert basemap in ['10m', '50m', '110m'], ('Resolution has to be one '
+                          "of '10m', '50m', '110m'")
+        ax.set_extent([x1, x2, y1, y2], crs=ccrs.PlateCarree())
+        ax.coastlines(linewidth=0.4, zorder=-1, resolution=basemap)
+        border = cartopy.feature.BORDERS.with_scale(basemap)
+        ax.add_feature(border, linewidth=0.3)
+
+    return x,y
+
+
+
+
+#This function was born out of a breakout group at the October 2017
 #Munich Open Energy Modelling Initiative Workshop to hack together a
 #working example of plotly for networks, see:
 #https://forum.openmod-initiative.org/t/breakout-group-on-visualising-networks-with-plotly/384/7
@@ -495,6 +592,9 @@ def iplot(network, fig=None, bus_colors='grey',
 
 
 def directed_flow(n, flow, flow_scale=None, ax=None, line_colors='darkgreen'):
+    """
+    Helper function to generate arrows from flow data.
+    """
 #    this funtion is used for diplaying arrows representing the network flow
     from matplotlib.patches import FancyArrow
     if flow_scale is None:
