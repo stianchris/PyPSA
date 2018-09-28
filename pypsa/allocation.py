@@ -8,11 +8,15 @@ Created on Wed Feb 21 12:14:49 2018
 
 # This side-package is created for use as flow and cost allocation.
 
-from .pf import calculate_PTDF
+from .pf import calculate_PTDF, find_cycles
+from pandas import IndexSlice as idx
 from numpy.linalg import inv
 import pandas as pd
 import numpy as np
+import scipy as sp
 import logging
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -21,6 +25,26 @@ logger = logging.getLogger(__name__)
 
 def pinv(df):
     return pd.DataFrame(np.linalg.pinv(df), df.columns, df.index)
+
+
+def null(df):
+    return pd.DataFrame(sp.linalg.null_space(df), index=df.columns)
+
+
+def cycles(n):
+    find_cycles(n, weight=None, dense=True)
+    return n.C
+
+def mixed_cycle_flows(n, snapshot=None):
+    if snapshot is None:
+        snapshot = n.snapshots[0]
+    f = pd.concat([n.lines_t.p0.loc[snapshot], n.links_t.p0.loc[snapshot]],
+              keys=['Line', 'Link'])
+    cycle_mask = cycles(n)#.loc[:,lambda df: ~(df.loc['Link'] == 0).all()]
+    cycle_flow = (cycle_mask.mul(f, axis=0)
+                  .div(susceptance(n, ['Line', 'Link'], snapshot), axis=0)
+                  )
+    return cycle_flow
 
 
 def diag(df):
@@ -50,26 +74,45 @@ def incidence_matrix(n, branch_components=['Link', 'Line']):
     return pd.concat(K, keys=branch_components, axis=1)
 
 
-def PTDF(n, branch_components={'Line'}, snapshot=None, scale=1.):
-    n.calculate_dependent_values()
+def susceptance(n, branch_components=['Line'], snapshot=None):
     n.lines = n.lines.assign(carrier=n.lines.bus0.map(n.buses.carrier))
     assert (n.lines.carrier == n.lines.bus1.map(n.buses.carrier)).all()
+    sus = (pd.concat([(1/(n.lines.x_pu.where(n.lines.carrier == 'AC', 0) +
+                          n.lines.r_pu.where(n.lines.carrier == 'DC', 0)))],
+           keys=['Line']))
+
+    if 'Link' in branch_components:
+        if snapshot is None:
+            logger.warn('Link in argument "branch_components", but no '
+                        'snapshot given. Falling back to first snapshot')
+            snapshot = n.snapshots[0]
+        elif isinstance(snapshot, pd.DatetimeIndex):
+            snapshot = snapshot[0]
+        # get cycle with links included
+        cycle_mask = cycles(n).loc[:, lambda df: ~(df.loc['Link'] == 0).all()]
+        sus_line = sus.reindex(cycle_mask.index, fill_value=1)
+
+        f = pd.concat([n.lines_t.p0.loc[snapshot], n.links_t.p0.loc[snapshot]],
+                      keys=['Line', 'Link'])
+        cycle_line_flow = (cycle_mask.loc['Line']
+                           .mul(f.loc['Line'], axis=0)
+                           .div(sus_line.loc['Line'], axis=0).sum())
+        link_weighting = -(cycle_mask.loc['Link'].mul(f.loc['Link'], axis=0)
+                          .div(cycle_line_flow)
+                          # for multiple links in one cycle:
+                          .pipe(lambda df: df*(df!=0).sum()))
+        sus_link = (pd.concat([link_weighting.sum(1)], keys=['Link'])
+                     .reindex(cycle_mask.index, fill_value=1))
+
+        sus = sus_line * sus_link
+    return sus.loc[idx[branch_components, :]]
+
+
+def PTDF(n, branch_components={'Line'}, snapshot=None):
+    n.calculate_dependent_values()
     K = incidence_matrix(n, branch_components)
-    omega = []
-    for c in branch_components:
-        if c == 'Line':
-            (omega.append(1/(n.lines.x_pu.where(n.lines.carrier == 'AC', 0)
-             + n.lines.r_pu.where(n.lines.carrier == 'DC', 0))))
-        if c == 'Link':
-            if snapshot is None:
-                logger.warn('Link in argument "branch_components", but no '
-                            'snapshot given. Falling back to first snapshot')
-                snapshot = n.snapshots[0]
-            elif isinstance(snapshot, pd.DatetimeIndex):
-                snapshot = snapshot[0]
-            omega.append(n.links_t.p0.loc[snapshot].T *scale)
-    Omega = diag(pd.concat(omega, keys=branch_components))
-    return Omega.dot(K.T).dot(pinv(K.dot(Omega).dot(K.T))), pd.concat(omega, keys=branch_components)
+    Omega = diag(susceptance(n, branch_components, snapshot))
+    return Omega.dot(K.T).dot(pinv(K.dot(Omega).dot(K.T)))
 
 
 def network_injection(n, snapshots=None):
@@ -98,9 +141,10 @@ def is_balanced(n, tol=1e-9):
     K = incidence_matrix(n)
     F = pd.concat([n.lines_t.p0, n.links_t.p0], axis=1,
                   keys=['Line', 'Link']).T
-    return (K.dotF).sum(0).max() < tol
+    return (K.dot(F)).sum(0).max() < tol
 
-#%%
+# %%
+
 
 def average_participation(n, snapshot, per_bus=False, normalized=False,
                           downstream=True):
@@ -158,18 +202,17 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
     buses = n.buses.index
     lines = n.lines.index
     links = n.links.index
-    f_in = (n.lines_t.p0.loc[[snapshot]].T
-             .append(n.links_t.p0.loc[[snapshot]].T))
-    f_out = (-n.lines_t.p1.loc[[snapshot]].T
-             .append(n.links_t.p1.loc[[snapshot]].T))
+    f_in = (pd.concat([n.pnl(c).p0.loc[snapshot] for c in ['Line', 'Link']],
+                keys=['Line', 'Link'], sort=True))
+    f_out = (pd.concat([-n.pnl(c).p1.loc[snapshot] for c in ['Line', 'Link']],
+                keys=['Line', 'Link'], sort=True))
+
     p = n.buses_t.p.loc[[snapshot]].T
-    K = pd.DataFrame(n.incidence_matrix(branch_components={'Line', 'Link'},
-                                        busorder=buses).todense(),
-                     index=buses, columns=lines.append(links))
+    K = incidence_matrix(n)
 #    set incidence matrix in direction of flow
-    K = K.mul(np.sign(f_in[snapshot]))
-    f_in = f_in.abs()
-    f_out = f_out.abs()
+    K = K.mul(np.sign(f_in))
+    f_in = f_in.abs().to_frame()
+    f_out = f_out.abs().to_frame()
 
     n_in = K.clip_upper(0).dot(f_in).abs()  # network inflow
     p_in = p.clip_lower(0)  # nodal inflow
@@ -177,7 +220,7 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
 
     F_in = (p_in + n_in)[snapshot]
     nzero_i = F_in[F_in != 0].index
-#   F_in = F_out = (p_out + n_out)[snapshot]
+#   F_in == F_out == (p_out + n_out)[snapshot]
 
     # flows from bus (index) to bus (columns):
     F = (K.dot(diag(f_in)).clip_lower(0).dot(K.T).clip_upper(0).abs())
@@ -221,12 +264,13 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
             tag = '/sink'
 
         T = T.mul((weight), axis=0)
-        T = diag(T) - T[ref_b].reindex_like(T, fill_value=0)
+        T = diag(T) - T[ref_b].reindex_like(T).fillna(0)
         T = PTDF(n, branch_components=['Link', 'Line']).dot(T).round(10)
         if normalized:
             T.div(f_in[snapshot], axis=0)
-        T = T.rename_axis('line').rename_axis('bus' + tag, axis=1).T
-        T = T.stack()[lambda ds: ds != 0]
+        column_names = ['component', 'name']
+        T = T.rename_axis(column_names).rename_axis('bus' + tag, axis=1).T
+        T = T.unstack()[lambda ds: ds != 0]
     return pd.concat([T], keys=[snapshot], names=['snapshots'])
 
 

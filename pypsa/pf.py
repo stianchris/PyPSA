@@ -848,7 +848,7 @@ def find_tree(sub_network, weight='x_pu'):
             sub_network.T[branch_i,j] = sign
 
 
-def find_cycles(sub_network, weight='x_pu'):
+def find_cycles(sub_network, weight='x_pu', dense=False):
     """
     Find all cycles in the sub_network and record them in sub_network.C.
 
@@ -895,6 +895,9 @@ def find_cycles(sub_network, weight='x_pu'):
                 sub_network.C[first_i,c] = 1
                 sub_network.C[b_i,c] = sign
                 c+=1
+    if dense:
+        sub_network.C = pd.DataFrame(sub_network.C.todense(), index=branches_i)
+
 
 def sub_network_lpf(sub_network, snapshots=None, skip_pre=False):
     """
