@@ -43,13 +43,13 @@ try:
     from matplotlib.patches import Wedge
     from matplotlib.collections import LineCollection, PatchCollection
     from matplotlib.lines import Line2D
-except ModuleNotFoundError:
+except:
     plt_present = False
 
 basemap_present = True
 try:
     from mpl_toolkits.basemap import Basemap
-except ModuleNotFoundError:
+except:
     basemap_present = False
 
 
@@ -57,14 +57,14 @@ cartopy_present = True
 try:
     import cartopy
     import cartopy.crs as ccrs
-except ModuleNotFoundError:
+except:
     cartopy_present = False
 
 
 pltly_present = True
 try:
         import plotly.offline as pltly
-except ModuleNotFoundError:
+except:
         pltly_present = False
 
 idx = pd.IndexSlice
