@@ -35,15 +35,15 @@ def cycles(n):
     find_cycles(n, weight=None, dense=True)
     return n.C
 
+
 def mixed_cycle_flows(n, snapshot=None):
     if snapshot is None:
         snapshot = n.snapshots[0]
     f = pd.concat([n.lines_t.p0.loc[snapshot], n.links_t.p0.loc[snapshot]],
               keys=['Line', 'Link'])
-    cycle_mask = cycles(n)#.loc[:,lambda df: ~(df.loc['Link'] == 0).all()]
-    cycle_flow = (cycle_mask.mul(f, axis=0)
+    cycle_flow = (cycles(n).mul(f, axis=0)
                   .div(susceptance(n, ['Line', 'Link'], snapshot), axis=0)
-                  )
+                  .fillna(0))
     return cycle_flow
 
 
@@ -61,6 +61,15 @@ def diag(df):
             return pd.DataFrame(np.diagflat(np.diag(df)), df.index, df.columns)
     return pd.DataFrame(np.diagflat(df.values),
                         index=df.index, columns=df.index)
+
+
+
+def eig(M):
+    val, vec = np.linalg.eig(M)
+    val = pd.Series(val).sort_values(ascending=False)
+    vec = pd.DataFrame(vec, index=M.index).reindex(columns=val.index)
+    return val, vec
+
 
 
 def incidence_matrix(n, branch_components=['Link', 'Line']):
@@ -94,16 +103,31 @@ def susceptance(n, branch_components=['Line'], snapshot=None):
 
         f = pd.concat([n.lines_t.p0.loc[snapshot], n.links_t.p0.loc[snapshot]],
                       keys=['Line', 'Link'])
-        cycle_line_flow = (cycle_mask.loc['Line']
-                           .mul(f.loc['Line'], axis=0)
-                           .div(sus_line.loc['Line'], axis=0).sum())
-        link_weighting = -(cycle_mask.loc['Link'].mul(f.loc['Link'], axis=0)
-                          .div(cycle_line_flow)
-                          # for multiple links in one cycle:
-                          .pipe(lambda df: df*(df!=0).sum()))
-        sus_link = (pd.concat([link_weighting.sum(1)], keys=['Link'])
-                     .reindex(cycle_mask.index, fill_value=1))
+        cycle_line_sus_flow = (cycle_mask.loc[['Line']]
+                               .mul(f.loc[['Line']], axis=0)
+                               .div(sus_line.loc[['Line']], axis=0))
+#        lk_weights = -(cycle_mask.loc['Link']\
+#                       .mul(f.loc['Link'], axis=0)\
+#                       .div(cycle_line_flow.replace(0, 1))\
+#                       # for multiple links in one cycle:
+#                       .pipe(lambda df: df * (df != 0).sum()) \
+#                       # for one link in mulitple cycles
+#                       .where(lambda df: df != 0).mean(1))
+#        lk_weights = lk_weights.where(lk_weights.notnull(), f.loc['Link'])
+#
+#        sus_link = (pd.concat([lk_weights], keys=['Link'])
+#                     .reindex(cycle_mask.index, fill_value=1))
 
+
+        # fill not-in-cycles links with current flow
+        cycle_link_flow = cycle_mask.mul(f, axis=0).loc[['Link']]
+        p, res, rnk, s = \
+                sp.linalg.lstsq(cycle_link_flow.T, -cycle_line_sus_flow.sum())
+        sus_link = (pd.DataFrame(p, index=cycle_link_flow.index)[0]
+                    .pow(-1)
+                    .replace(np.inf, 0)
+                    .where(lambda df: df != 0, f.loc[['Link']])
+                    .reindex(cycle_mask.index, fill_value=1))
         sus = sus_line * sus_link
     return sus.loc[idx[branch_components, :]]
 
@@ -200,8 +224,6 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
 
     n.calculate_dependent_values()
     buses = n.buses.index
-    lines = n.lines.index
-    links = n.links.index
     f_in = (pd.concat([n.pnl(c).p0.loc[snapshot] for c in ['Line', 'Link']],
                 keys=['Line', 'Link'], sort=True))
     f_out = (pd.concat([-n.pnl(c).p1.loc[snapshot] for c in ['Line', 'Link']],

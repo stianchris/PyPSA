@@ -745,8 +745,9 @@ class Network(Basic):
     #beware, this turns bools like s_nom_extendable into objects because of
     #presence of links without s_nom_extendable
     def branches(self):
-        return pd.concat((self.df(c) for c in self.branch_components),
-                         keys=self.branch_components, sort=False)
+        return (pd.concat((self.df(c) for c in self.branch_components),
+                         keys=self.branch_components, sort=True)
+                .reindex(sorted(self.branch_components), level=0))
 
     def passive_branches(self):
         return pd.concat((self.df(c) for c in self.passive_branch_components),

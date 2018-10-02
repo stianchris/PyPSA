@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 __author__ = "Tom Brown (FIAS), Jonas Hoersch (FIAS)"
 __copyright__ = ("Copyright 2015-2017 Tom Brown (FIAS), Jonas Hoersch (FIAS), "
-                "GNU GPL 3")
+                 "GNU GPL 3")
 
 
 plt_present = True
@@ -43,13 +43,13 @@ try:
     from matplotlib.patches import Wedge
     from matplotlib.collections import LineCollection, PatchCollection
     from matplotlib.lines import Line2D
-except:
+except ModuleNotFoundError:
     plt_present = False
 
 basemap_present = True
 try:
     from mpl_toolkits.basemap import Basemap
-except:
+except ModuleNotFoundError:
     basemap_present = False
 
 
@@ -57,15 +57,17 @@ cartopy_present = True
 try:
     import cartopy
     import cartopy.crs as ccrs
-except:
+except ModuleNotFoundError:
     cartopy_present = False
 
 
 pltly_present = True
 try:
         import plotly.offline as pltly
-except:
+except ModuleNotFoundError:
         pltly_present = False
+
+idx = pd.IndexSlice
 
 
 branch_defaults = pd.DataFrame({
@@ -216,7 +218,7 @@ def plot(n, margin=0.05, ax=None, basemap=True, bus_colors='grey',
         ax.add_collection(bus_collection)
     else:
         c = pd.Series(bus_colors, index=n.buses.index)
-        s = pd.Series(bus_sizes, index=n.buses.index, dtype="float").fillna(10)
+        s = pd.Series(bus_sizes, index=n.buses.index, dtype="float").fillna(0)
         bus_collection = ax.scatter(x, y, c=c, s=s, cmap=bus_cmap,
                                     edgecolor='face')
 
@@ -239,7 +241,7 @@ def plot(n, margin=0.05, ax=None, basemap=True, bus_colors='grey',
                 .agg(flow, axis=0))
     if flow is not None:
         # set a rough estimate of flow_scale
-        flow_scale = (len(n.lines)+100)**1.7 / line_widths
+        flow_scale = (len(n.lines)+100) / line_widths
         arrows = directed_flow(n, flow, ax=ax, flow_scale=flow_scale,
                                line_colors=line_colors)
         branch_collections.append(arrows)
@@ -314,8 +316,7 @@ def marker_from_color_series(ds):
 
 
 def as_series(ser, n, components, default=np.nan):
-    index = pd.concat([n.df(c) for c in components], keys=components,
-                      sort=True).index
+    index = n.branches().loc[idx[components, :], :].index
     if not isinstance(ser, (pd.Series, dict)):
         ser = pd.Series(ser, index=index)
     elif isinstance(ser, pd.Series) & isinstance(ser.index, pd.MultiIndex):
@@ -329,14 +330,14 @@ def as_series(ser, n, components, default=np.nan):
         default = pd.Series(default).reindex(index, level=0)
     return ser.where(ser.notnull(), default)
 
+
 def compute_bbox_with_margins(margin, x, y):
-    #set margins
+    # set margins
     pos = np.asarray((x, y))
     minxy, maxxy = pos.min(axis=1), pos.max(axis=1)
     xy1 = minxy - margin*(maxxy - minxy)
     xy2 = maxxy + margin*(maxxy - minxy)
     return tuple(xy1), tuple(xy2)
-
 
 
 def draw_map(network=None, jitter=None, ax=None, boundaries=None,
@@ -368,16 +369,71 @@ def draw_map(network=None, jitter=None, ax=None, boundaries=None,
 
     if cartopy_present:
         resolution = '50m' if isinstance(basemap, bool) else basemap
-        assert resolution in ['10m', '50m', '110m'], ('Resolution has to be '
-                             "one of '10m', '50m', '110m'")
+        assert resolution in ['10m', '50m', '110m'], (
+                "Resolution has to be one of '10m', '50m', '110m'")
         ax.set_extent([x1, x2, y1, y2], crs=ccrs.PlateCarree())
         ax.coastlines(linewidth=0.4, zorder=-1, resolution=resolution)
         border = cartopy.feature.BORDERS.with_scale(resolution)
         ax.add_feature(border, linewidth=0.3)
 
-    return x,y
+    return x, y
 
 
+def directed_flow(n, flow, flow_scale=None, ax=None, line_colors='darkgreen',
+                  branch_comps=['Line', 'Link']):
+    """
+    Helper function to generate arrows from flow data.
+    """
+#    this funtion is used for diplaying arrows representing the network flow
+    from matplotlib.patches import FancyArrow
+    if flow_scale is None:
+        flow_scale = 1
+    if ax is None:
+        ax = plt.gca()
+#    set the scale of the arrowsizes
+    fdata = pd.concat([pd.DataFrame(
+                      {'x1': n.df(l).bus0.map(n.buses.x),
+                       'y1': n.df(l).bus0.map(n.buses.y),
+                       'x2': n.df(l).bus1.map(n.buses.x),
+                       'y2': n.df(l).bus1.map(n.buses.y)})
+                      for l in branch_comps], keys=branch_comps)
+    fdata['arrowsize'] = (flow.abs()
+                          .pipe(lambda ds: np.sqrt(ds / flow_scale))
+                          .clip(lower=1e-8) / 2.)
+    fdata['direction'] = np.sign(flow)
+    fdata['linelength'] = (np.sqrt((fdata.x1 - fdata.x2)**2. +
+                           (fdata.y1 - fdata.y2)**2))
+    fdata['arrowtolarge'] = (1.5 * fdata.arrowsize >
+                             fdata.loc[:, 'linelength'])
+
+    # swap coords for negativ directions
+    fdata.loc[fdata.direction == -1., ['x1', 'x2', 'y1', 'y2']] = \
+        fdata.loc[fdata.direction == -1., ['x2', 'x1', 'y2', 'y1']].values
+
+    fdata['arrows'] = (
+            fdata[(fdata.linelength > 0.) & (~fdata.arrowtolarge)]
+            .apply(lambda ds:
+                   FancyArrow(ds.x1, ds.y1,
+                              0.6*(ds.x2 - ds.x1) - ds.arrowsize
+                              * 0.75 * (ds.x2 - ds.x1) / ds.linelength,
+                              0.6 * (ds.y2 - ds.y1) - ds.arrowsize
+                              * 0.75 * (ds.y2 - ds.y1)/ds.linelength,
+                              head_width=ds.arrowsize), axis=1))
+    fdata.loc[(fdata.linelength > 0.) & (fdata.arrowtolarge), 'arrows'] = \
+        (fdata[(fdata.linelength > 0.) & (fdata.arrowtolarge)]
+         .apply(lambda ds:
+                FancyArrow(ds.x1, ds.y1,
+                           0.001*(ds.x2 - ds.x1),
+                           0.001*(ds.y2 - ds.y1),
+                           head_width=ds.arrowsize), axis=1))
+    fdata = fdata.assign(color=line_colors)
+    arrowcol = PatchCollection(fdata[fdata.arrows.notnull()].arrows,
+                               color=fdata.color,
+                               edgecolors='k',
+                               linewidths=0.,
+                               zorder=2, alpha=1)
+    ax.add_collection(arrowcol)
+    return arrowcol
 
 
 #This function was born out of a breakout group at the October 2017
@@ -538,65 +594,3 @@ def iplot(network, fig=None, bus_colors='grey',
 
 
 
-def directed_flow(n, flow, flow_scale=None, ax=None, line_colors='darkgreen',
-                  branch_comps=['Line', 'Link']):
-    """
-    Helper function to generate arrows from flow data.
-    """
-#    this funtion is used for diplaying arrows representing the network flow
-    from matplotlib.patches import FancyArrow
-    if flow_scale is None:
-        flow_scale = 1
-    if ax is None:
-        ax = plt.gca()
-#    set the scale of the arrowsizes
-    arrowsize = (flow.abs()
-                .pipe(lambda ds: np.sqrt(ds/flow_scale))
-                .clip(lower=1e-8))/3.
-    fdata = pd.concat(
-            [pd.DataFrame(
-                    {'x1': n.df(l).bus0.map(n.buses.x),
-                     'y1': n.df(l).bus0.map(n.buses.y),
-                     'x2': n.df(l).bus1.map(n.buses.x),
-                     'y2': n.df(l).bus1.map(n.buses.y),
-                     # make area not width proportional to flow
-                     'arrowsize': arrowsize.loc[l].reindex((n.df(l).index)),
-                     'direction': np.sign(flow).loc[l]
-                                  .reindex((n.df(l).index))})
-            for l in branch_comps],
-            keys=branch_comps)
-    fdata['linelength'] = (np.sqrt((fdata.x1-fdata.x2)**2.+
-                                        (fdata.y1 - fdata.y2)**2))
-    fdata['arrowtolarge'] = (1.5 * fdata.arrowsize
-                                            > fdata.loc[:, 'linelength'])
-
-    #swap coords for negativ directions
-    fdata.loc[fdata.direction==-1., ['x1', 'x2', 'y1', 'y2']] = (
-        fdata.loc[fdata.direction==-1., ['x2', 'x1', 'y2', 'y1']].values)
-
-    fdata['arrows'] = (
-            fdata[(fdata.linelength>0.)&(~fdata.arrowtolarge)]
-                .apply(lambda ds:
-                    FancyArrow(ds.x1, ds.y1,
-                               0.6*(ds.x2 - ds.x1)-ds.arrowsize
-                                   *0.75*(ds.x2 - ds.x1)/ds.linelength,
-                               0.6*(ds.y2 - ds.y1)-ds.arrowsize
-                                   *0.75*(ds.y2 - ds.y1)/ds.linelength,
-                               head_width=ds.arrowsize
-                               ), axis=1) )
-    fdata.loc[(fdata.linelength>0.)&(fdata.arrowtolarge), 'arrows']= (
-            fdata[(fdata.linelength>0.)&(fdata.arrowtolarge)]
-                .apply(lambda ds:
-                    FancyArrow(ds.x1, ds.y1,
-                               0.001*(ds.x2 - ds.x1),
-                               0.001*(ds.y2 - ds.y1),
-                               head_width=ds.arrowsize
-                               ), axis=1) )
-    fdata = fdata.assign(color=line_colors)
-    arrowcol = PatchCollection(fdata[fdata.arrows.notnull()].arrows,
-                              color=fdata.color,
-                              edgecolors='k',
-                              linewidths=0.,
-                              zorder=2, alpha=1)
-    ax.add_collection(arrowcol)
-    return arrowcol
