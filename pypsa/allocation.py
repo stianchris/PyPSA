@@ -40,7 +40,7 @@ def mixed_cycle_flows(n, snapshot=None):
     if snapshot is None:
         snapshot = n.snapshots[0]
     f = pd.concat([n.lines_t.p0.loc[snapshot], n.links_t.p0.loc[snapshot]],
-              keys=['Line', 'Link'])
+                  keys=['Line', 'Link'])
     cycle_flow = (cycles(n).mul(f, axis=0)
                   .div(susceptance(n, ['Line', 'Link'], snapshot), axis=0)
                   .fillna(0))
@@ -74,13 +74,12 @@ def eig(M):
 
 def incidence_matrix(n, branch_components=['Link', 'Line']):
     buses = n.buses.index
-    K = []
-    for c in n.iterate_components(branch_components):
-        K.append((c.df.assign(K=1).set_index('bus0', append=True)['K']
-                 .unstack().reindex(columns=buses).fillna(0)
-                 - c.df.assign(K=1).set_index('bus1', append=True)['K']
-                 .unstack().reindex(columns=buses).fillna(0)).T)
-    return pd.concat(K, keys=branch_components, axis=1)
+    return pd.concat([(n.df(c).assign(K=1).set_index('bus0', append=True)['K']
+                     .unstack().reindex(columns=buses).fillna(0).T)
+                     - (n.df(c).assign(K=1).set_index('bus1', append=True)['K']
+                     .unstack().reindex(columns=buses).fillna(0).T)
+                     for c in branch_components],
+                     keys=branch_components, axis=1, sort=False)
 
 
 def susceptance(n, branch_components=['Line'], snapshot=None):
@@ -98,41 +97,37 @@ def susceptance(n, branch_components=['Line'], snapshot=None):
         elif isinstance(snapshot, pd.DatetimeIndex):
             snapshot = snapshot[0]
         # get cycle with links included
-        cycle_mask = cycles(n).loc[:, lambda df: ~(df.loc['Link'] == 0).all()]
-        sus_line = sus.reindex(cycle_mask.index, fill_value=1)
-
+        link_cycles = cycles(n).loc[:, lambda df: ~(df.loc['Link'] == 0).all()]
         f = pd.concat([n.lines_t.p0.loc[snapshot], n.links_t.p0.loc[snapshot]],
                       keys=['Line', 'Link'])
-        cycle_line_sus_flow = (cycle_mask.loc[['Line']]
-                               .mul(f.loc[['Line']], axis=0)
-                               .div(sus_line.loc[['Line']], axis=0))
-#        lk_weights = -(cycle_mask.loc['Link']\
-#                       .mul(f.loc['Link'], axis=0)\
-#                       .div(cycle_line_flow.replace(0, 1))\
-#                       # for multiple links in one cycle:
-#                       .pipe(lambda df: df * (df != 0).sum()) \
-#                       # for one link in mulitple cycles
-#                       .where(lambda df: df != 0).mean(1))
-#        lk_weights = lk_weights.where(lk_weights.notnull(), f.loc['Link'])
-#
-#        sus_link = (pd.concat([lk_weights], keys=['Link'])
-#                     .reindex(cycle_mask.index, fill_value=1))
-
+        # effective cycles:
+        link_cycles = link_cycles.loc[:, ~(link_cycles != 0)[(f.round(8) == 0)].any()]
+        sus_line = sus.reindex(link_cycles.index, fill_value=1)
+        cycle_line_sus_flow_sum = (link_cycles.loc[['Line']]
+                                   .mul(f.loc[['Line']], axis=0)
+                                   .div(sus_line.loc[['Line']], axis=0).sum())
 
         # fill not-in-cycles links with current flow
-        cycle_link_flow = cycle_mask.mul(f, axis=0).loc[['Link']]
-        p, res, rnk, s = \
-                sp.linalg.lstsq(cycle_link_flow.T, -cycle_line_sus_flow.sum())
+        cycle_link_flow = link_cycles.mul(f, axis=0).loc[['Link']]
+        if link_cycles.empty:
+            p = pd.Series(0., cycle_link_flow.index)
+        elif (cycle_line_sus_flow_sum == 0).all():
+            p = sp.linalg.null_space(cycle_link_flow.T)[:,0]
+        else:
+            p, res, rnk, s = \
+                sp.linalg.lstsq(cycle_link_flow.T, -cycle_line_sus_flow_sum)
+#        import pdb; pdb.set_trace()
         sus_link = (pd.DataFrame(p, index=cycle_link_flow.index)[0]
                     .pow(-1)
                     .replace(np.inf, 0)
+                    # add current link flows for not-in-cycle-links
                     .where(lambda df: df != 0, f.loc[['Link']])
-                    .reindex(cycle_mask.index, fill_value=1))
+                    .reindex(link_cycles.index, fill_value=1))
         sus = sus_line * sus_link
     return sus.loc[idx[branch_components, :]]
 
 
-def PTDF(n, branch_components={'Line'}, snapshot=None):
+def PTDF(n, branch_components=['Line'], snapshot=None):
     n.calculate_dependent_values()
     K = incidence_matrix(n, branch_components)
     Omega = diag(susceptance(n, branch_components, snapshot))
