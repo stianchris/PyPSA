@@ -10,7 +10,6 @@ Created on Wed Feb 21 12:14:49 2018
 
 from .pf import calculate_PTDF, find_cycles
 from pandas import IndexSlice as idx
-from numpy.linalg import inv
 import pandas as pd
 import numpy as np
 import scipy as sp
@@ -26,14 +25,20 @@ logger = logging.getLogger(__name__)
 def pinv(df):
     return pd.DataFrame(np.linalg.pinv(df), df.columns, df.index)
 
+def inv(df):
+    return pd.DataFrame(np.linalg.inv(df), df.columns, df.index)
+
 
 def null(df):
     return pd.DataFrame(sp.linalg.null_space(df), index=df.columns)
 
 
 def cycles(n):
-    find_cycles(n, weight=None, dense=True)
-    return n.C
+    if not 'C' in n.__dir__():
+        find_cycles(n, weight=None, dense=True)
+        return n.C
+    else:
+        return n.C
 
 
 def mixed_cycle_flows(n, snapshot=None):
@@ -101,7 +106,8 @@ def susceptance(n, branch_components=['Line'], snapshot=None):
         f = pd.concat([n.lines_t.p0.loc[snapshot], n.links_t.p0.loc[snapshot]],
                       keys=['Line', 'Link'])
         # effective cycles:
-        link_cycles = link_cycles.loc[:, ~(link_cycles != 0)[(f.round(8) == 0)].any()]
+        link_cycles = (link_cycles
+                       .loc[:, ~(link_cycles != 0)[(f.round(8) == 0)].any()])
         sus_line = sus.reindex(link_cycles.index, fill_value=1)
         cycle_line_sus_flow_sum = (link_cycles.loc[['Line']]
                                    .mul(f.loc[['Line']], axis=0)
@@ -134,7 +140,7 @@ def PTDF(n, branch_components=['Line'], snapshot=None):
     return Omega.dot(K.T).dot(pinv(K.dot(Omega).dot(K.T)))
 
 
-def network_injection(n, snapshots=None):
+def network_injection(n, snapshots=None, branch_components=['Link', 'Line']):
     """
     Function to determine the total network injection including passive and
     active branches.
@@ -143,14 +149,27 @@ def network_injection(n, snapshots=None):
         snapshots = n.snapshots
     if isinstance(snapshots, pd.Timestamp):
         snapshots = [snapshots]
-    return (pd.concat({c.name:
-            c.pnl.p.multiply(c.df.sign, axis=1)
-            .groupby(c.df.bus, axis=1).sum()
-            for c in n.iterate_components(n.controllable_one_port_components)},
-            sort=True)
-            .sum(level=1)
-            .reindex(index=snapshots, columns=n.buses_t.p.columns,
-                     fill_value=0)).T
+    if branch_components == ['Line']:
+        return n.buses_t.p.loc[snapshots].T
+    elif sorted(branch_components) == ['Line', 'Link']:
+        if 'p_n' not in n.buses_t.keys():
+            n.buses_t['p_n'] = (sum(n.pnl(l)['p{}'.format(i)]
+                                .groupby(n.df(l)['bus{}'.format(i)], axis=1)
+                                .sum()
+                                .reindex(columns=n.buses.index, fill_value=0)
+                                for l in ['Link', 'Line'] for i in [0, 1])
+                                .round(10))
+        return n.buses_t['p_n'].loc[snapshots]
+    elif branch_components == ['Link']:
+        if 'p_link' not in n.buses_t.keys():
+            n.buses_t['p_link'] = (sum(n.pnl(l)['p{}'.format(i)]
+                                   .groupby(n.df(l)['bus{}'.format(i)], axis=1)
+                                   .sum()
+                                   .reindex(columns=n.buses.index,
+                                            fill_value=0)
+                                   for l in ['Link'] for i in [0, 1])
+                                   .round(10))
+        return n.buses_t['p_link'].loc[snapshots]
 
 
 def is_balanced(n, tol=1e-9):
@@ -162,11 +181,157 @@ def is_balanced(n, tol=1e-9):
                   keys=['Line', 'Link']).T
     return (K.dot(F)).sum(0).max() < tol
 
+
+def power_production(n, snapshots=None,
+                     components=['Generator', 'StorageUnit'], override=False):
+    if snapshots is None:
+        snapshots = n.snapshots
+    if 'p_plus' not in n.buses_t or override:
+        n.buses_t.p_plus = (sum(n.pnl(c).p.T
+                            .clip_lower(0)
+                            .assign(bus=n.df(c).bus)
+                            .groupby('bus').sum().T
+                            for c in components)
+                            .rename_axis('source', axis=1)
+                            .rename_axis('snapshot'))
+    return n.buses_t.p_plus.loc[snapshots]
+
+
+def power_demand(n, snapshots=None,
+                 components=['Load', 'StorageUnit'], override=False):
+    if snapshots is None:
+        snapshots = n.snapshots
+    if 'p_minus' not in n.buses_t or override:
+        n.buses_t.p_minus = (sum(n.pnl(c).p.T
+                             .mul(n.df(c).sign, axis=0)
+                             .clip_upper(0)
+                             .assign(bus=n.df(c).bus)
+                             .groupby('bus').sum().T
+                             for c in components).abs()
+                             .rename_axis('sink', axis=1)
+                             .rename_axis('snapshot'))
+    return n.buses_t.p_minus.loc[snapshots]
+
+
+
+def expand_by_source_type(ds, n,
+                          components=['Generator', 'StorageUnit']):
+    """
+    Breakdown allocation into generation carrier type. These include carriers
+    of all components specified by 'components'. Note that carrier names of all
+    components have to be unique.
+
+    Pararmeter
+    ----------
+
+    ds : pd.Series
+        Allocation Series with at least index level 'source'
+    n : pypsa.Network()
+        Network which the allocation was derived from
+    components : list, default ['Generator', 'StorageUnit']
+        List of considered components. Carrier types of these components are
+        taken for breakdown.
+
+
+    Example
+    -------
+
+    ap = flow_allocation(n, n.snapshots, per_bus=True)
+    ap_carrier = pypsa.allocation.expand_by_carrier(ap, n)
+
+    """
+    sns = ds.index.unique('snapshot')
+    if components == ['Generator', 'StorageUnit']:
+        intersc = (pd.Index(n.storage_units.carrier.unique())
+                   .intersection(pd.Index(n.generators.carrier.unique())))
+        assert (intersc.empty), (
+                'Carrier names {} of compoents are not unique'.format(intersc))
+    p_in_per_bus_carrier = [(n.pnl(c).p.loc[sns].T
+                            .assign(carrier=n.df(c).carrier, bus=n.df(c).bus)
+                            .groupby(['bus', 'carrier']).sum().T
+                            .where(lambda x: x > 0)) for c in components]
+
+    share_per_bus_carrier = (pd.concat(p_in_per_bus_carrier, axis=1)
+                             .rename_axis(['snapshot'])
+                             .rename_axis(['source', 'sourcetype'], axis=1)
+                             .groupby(level='source', axis=1)
+                             .transform(lambda ds: ds/ds.sum())
+                             .swaplevel(axis=1)
+                             .dropna(axis=1, how='all'))
+
+    return (share_per_bus_carrier.unstack().dropna().reset_index(name='share')
+            .merge(ds.reset_index(name='allocation'),
+                   on=['snapshot', 'source'])
+            .set_index(['snapshot', 'sourcetype'] + ds.index.names[1:])
+            .eval('allocation * share')
+            .rename('allocation')
+            .dropna().sort_index())
+
+
+def expand_by_sink_type(ds, n,
+                        components=['Load', 'StorageUnit']):
+    """
+    Breakdown allocation into demand types, e.g. Storage carriers and Load.
+    These include carriers of all components specified by 'components'. Note
+    that carrier names of all components have to be unique.
+
+    Pararmeter
+    ----------
+
+    ds : pd.Series
+        Allocation Series with at least index level 'source'
+    n : pypsa.Network()
+        Network which the allocation was derived from
+    components : list, default ['Load', 'StorageUnit']
+        List of considered components. Carrier types of these components are
+        taken for breakdown.
+
+
+    Example
+    -------
+
+    ap = flow_allocation(n, n.snapshots, per_bus=True)
+    ap_carrier = pypsa.allocation.expand_by_carrier(ap, n)
+
+    """
+    sns = ds.index.unique('snapshot')
+
+    n.loads = n.loads.assign(carrier = 'load')
+    n.loads_t.p *= -1
+
+    p_out_per_bus_carrier = [(n.pnl(c).p.loc[sns].T
+                             .assign(carrier=n.df(c).carrier, bus=n.df(c).bus)
+                             .groupby(['bus', 'carrier']).sum().T
+                             .where(lambda x: x < 0)) for c in
+                             components]
+
+    n.loads = n.loads.drop(columns='carrier')
+    n.loads_t.p *= -1
+
+
+    share_per_bus_carrier = (pd.concat(p_out_per_bus_carrier, axis=1)
+                             .rename_axis(['snapshot'])
+                             .rename_axis(['sink', 'sinktype'], axis=1)
+                             .groupby(level='sink', axis=1)
+                             .transform(lambda ds: ds/ds.sum())
+                             .swaplevel(axis=1))
+
+
+    return (share_per_bus_carrier.unstack().dropna().reset_index(name='share')
+            .merge(ds.reset_index(name='allocation'),
+                   on=['snapshot', 'sink'])
+            .set_index(['snapshot', 'sinktype'] + ds.index.names[1:])
+            .eval('allocation * share')
+            .rename('allocation')
+            .dropna().sort_index())
+
+
 # %%
 
 
 def average_participation(n, snapshot, per_bus=False, normalized=False,
-                          downstream=True):
+                          downstream=True, branch_components=['Line', 'Link'],
+                          aggregated=True):
     """
     Allocate the network flow in according to the method 'Average
     participation' or 'Flow tracing' firstly presented in [1,2].
@@ -219,76 +384,97 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
 
     n.calculate_dependent_values()
     buses = n.buses.index
-    f_in = (pd.concat([n.pnl(c).p0.loc[snapshot] for c in ['Line', 'Link']],
-                keys=['Line', 'Link'], sort=True))
-    f_out = (pd.concat([-n.pnl(c).p1.loc[snapshot] for c in ['Line', 'Link']],
-                keys=['Line', 'Link'], sort=True))
+    f_in = (pd.concat([n.pnl(c).p0.loc[snapshot] for c in branch_components],
+                keys=branch_components, sort=True))
+    f_out = (pd.concat([-n.pnl(c).p1.loc[snapshot] for c in branch_components],
+                keys=branch_components, sort=True))
+    f = (n.branches().assign(flow=f_in)
+         .rename_axis(['component', 'branch_name'])
+         .set_index(['bus0', 'bus1'], append=True)['flow'])
 
-    p = n.buses_t.p.loc[[snapshot]].T
-    K = incidence_matrix(n)
+    p = network_injection(n, snapshot, branch_components).T
+    K = incidence_matrix(n, branch_components)
 #    set incidence matrix in direction of flow
     K = K.mul(np.sign(f_in))
     f_in = f_in.abs().to_frame()
     f_out = f_out.abs().to_frame()
 
     n_in = K.clip_upper(0).dot(f_in).abs()  # network inflow
-    p_in = p.clip_lower(0)  # nodal inflow
-    p_out = p.clip_upper(0).abs()  # nodal outflow
+    n_out = K.clip_lower(0).dot(f_out).abs()  # network outflow
+    if aggregated:
+        p_in = p.clip_lower(0)  # nodal inflow
+        p_out = p.clip_upper(0).abs()  # nodal outflow
+    else:
+        p_in = power_production(n, [snapshot]).T
+        p_out = power_demand(n, [snapshot]).T
 
     F_in = (p_in + n_in)[snapshot]
+    F_out = (p_out + n_out)[snapshot]
+
     nzero_i = F_in[F_in != 0].index
 #   F_in == F_out == (p_out + n_out)[snapshot]
 
-    # flows from bus (index) to bus (columns):
-    F = (K.dot(diag(f_in)).clip_lower(0).dot(K.T).clip_upper(0).abs())
+    # flows from bus (column) to bus (index):
+    F = (K.dot(diag(f_in)).clip_lower(0).dot(K.T).clip_upper(0).abs()
+         .rename_axis('in').rename_axis('out', axis=1)).T
 
-    # upstream
-    Q = (pd.DataFrame(inv((diag(F_in) - F.T).loc[nzero_i, nzero_i])
-                      .dot(diag(p_in.reindex(nzero_i))),
-                      index=nzero_i, columns=nzero_i)
-         .reindex(index=buses, columns=buses, fill_value=0))
     # downstream
-    R = (pd.DataFrame(inv((diag(F_in) - F).loc[nzero_i, nzero_i])
-                      .dot(diag(p_out.reindex(nzero_i))),
-                      index=nzero_i, columns=nzero_i)
-         .reindex(index=buses, columns=buses, fill_value=0))
+    Q = (inv((diag(F_in) - F).loc[nzero_i, nzero_i])
+         .dot(diag(p_in.reindex(nzero_i)))
+         .reindex(index=buses, columns=buses, fill_value=0)
+         .round(10))
+    # upstream
+    R = (inv((diag(F_out) - F.T).loc[nzero_i, nzero_i])
+         .dot(diag(p_out.reindex(nzero_i)))
+         .reindex(index=buses, columns=buses, fill_value=0)
+         .round(10))
 
     #  equation (12)
-    #  (Q.T.dot(diag(p_out)).T == R.T.dot(diag(p_in)) ).all().all()
+#      (Q.T.dot(diag(p_out)).T == R.T.dot(diag(p_in))).all().all()
+
+    if not normalized and per_bus:
+        if aggregated:
+            Q = Q.mul(power_production(n, snapshot), axis=0)
+            R = R.mul(power_demand(n, snapshot), axis=0)
+        else:
+            Q = Q.mul(p_out[snapshot], axis=0)
+            R = R.mul(p_in[snapshot], axis=0)
+
+    q = (Q.rename_axis('in').rename_axis('source', axis=1)
+         .stack()[lambda ds: ds != 0].swaplevel(0).sort_index()
+         .rename('upstream'))
+
+    r = (R.rename_axis('out').rename_axis('sink', axis=1)
+         .stack()[lambda ds: ds != 0].sort_index().rename('downstream'))
+
 
     if per_bus:
-        if not normalized:
-            Q = Q.mul(p_out[snapshot], axis=0)
-        Q = (Q.rename_axis('bus/sink').rename_axis('bus/source', axis=1)
-             .stack()[lambda ds: ds != 0])
-        if downstream:
-            T = Q.swaplevel(0).sort_index()
-        else:
-            #  equal to weighting and stacking (from above) with R:
-            T = Q
+        T = (pd.concat([q,r], axis=0, keys=['upstream', 'downstream'],
+                       names=['method', 'source', 'sink']))
+        if downstream is not None:
+            T = T.downstream if downstream else T.upstream
 
-#    create artificial injection patterns following the flow trace
     else:
-        if downstream:
-            T = Q
-            weight = (p_in + p_out)[snapshot]
-            ref_b = p_in[snapshot] == 0
-            tag = '/source'
-        else:
-            T = R
-            weight = F_in
-            ref_b = p_out[snapshot] == 0
-            tag = '/sink'
 
-        T = T.mul((weight), axis=0)
-        T = diag(T) - T[ref_b].reindex_like(T).fillna(0)
-        T = PTDF(n, branch_components=['Link', 'Line']).dot(T).round(10)
-        if normalized:
-            T.div(f_in[snapshot], axis=0)
-        column_names = ['component', 'name']
-        T = T.rename_axis(column_names).rename_axis('bus' + tag, axis=1).T
-        T = T.unstack()[lambda ds: ds != 0]
-    return pd.concat([T], keys=[snapshot], names=['snapshots'])
+        # absolute flow with directions
+        f_dir = (pd.concat([f[f > 0], -f[f < 0].swaplevel('bus0', 'bus1')
+                 .rename_axis(['component', 'branch_name', 'bus0', 'bus1'])])
+                 .rename_axis(['component', 'branch_name', 'in', 'out']))
+
+        # signs of the absolute flow relativ to line direction
+        f_sign = np.sign(f).set_axis(f.index.droplevel(['bus0', 'bus1']),
+                                     inplace=0).rename('sign')
+
+        # for each source mulitply outgoing flow (at destiny) with local
+        # ingoing line flow, for each sink ingoing flow at origin with local
+        # outgoing line flow. All in respect to line direction
+        T = (f_dir.reset_index().merge(q.reset_index(), on='in')
+             .merge(r.reset_index(), on='out')
+             .merge(f_sign.reset_index(), on=['component', 'branch_name'])
+             .set_index(['source', 'sink', 'component', 'branch_name'])
+             .eval('upstream * flow *  downstream * sign').sort_index())
+
+    return pd.concat([T], keys=[snapshot], names=['snapshot'])
 
 
 def marginal_participation(n, snapshot, q=0.5, normalized=False,
@@ -351,7 +537,7 @@ def marginal_participation(n, snapshot, q=0.5, normalized=False,
     else:
         Q = (Q.rename_axis('bus').rename_axis("line", axis=1)
              .stack().round(8)[lambda ds:ds != 0])
-    return pd.concat([Q], keys=[snapshot], names=['snapshots'])
+    return pd.concat([Q], keys=[snapshot], names=['snapshot'])
 
 
 def virtual_injection_pattern(n, snapshot, normalized=False, per_bus=False,
@@ -397,8 +583,8 @@ def virtual_injection_pattern(n, snapshot, normalized=False, per_bus=False,
     vip = indiag + offdiag
     if per_bus:
         Q = (vip[indiag.sum() == 0].T
-             .rename_axis('bus/sink', axis=int(downstream))
-             .rename_axis('bus/source', axis=int(not downstream))
+             .rename_axis('sink', axis=int(downstream))
+             .rename_axis('source', axis=int(not downstream))
              .stack()[lambda ds:ds != 0]).abs()
 #        switch to counter stream by Q.swaplevel(0).sort_index()
     else:
@@ -408,7 +594,7 @@ def virtual_injection_pattern(n, snapshot, normalized=False, per_bus=False,
             Q /= f
         Q = (Q.rename_axis('bus').rename_axis("line", axis=1)
              .stack().round(8)[lambda ds: ds != 0])
-    return pd.concat([Q], keys=[snapshot], names=['snapshots'])
+    return pd.concat([Q], keys=[snapshot], names=['snapshot'])
 
 
 def optimal_flow_shares(n, snapshot, method='min', downstream=True,
@@ -466,8 +652,8 @@ def optimal_flow_shares(n, snapshot, method='min', downstream=True,
                        index=n.buses.index).round(10)
     if per_bus:
         return (sol[indiag.sum()==0].T
-                .rename_axis('bus/sink', axis=int(downstream))
-                .rename_axis('bus/source', axis=int(not downstream))
+                .rename_axis('sink', axis=int(downstream))
+                .rename_axis('source', axis=int(not downstream))
                 .stack()[lambda ds:ds != 0])
     else:
         return H.dot(sol).round(8)
@@ -648,7 +834,7 @@ def flow_allocation(n, snapshots, method='Average participation', **kwargs):
     res : dict
         The returned dict consists of two values of which the first,
         'flow', represents the allocated flows within a mulitindexed
-        pandas.Series with levels ['snapshots', 'bus', 'line']. The
+        pandas.Series with levels ['snapshot', 'bus', 'line']. The
         second object, 'cost', returns the corresponding cost derived
         from the flow allocation.
     """
@@ -678,8 +864,9 @@ def flow_allocation(n, snapshots, method='Average participation', **kwargs):
 
     flow = pd.concat([method_func(n, sn, **kwargs) for sn in snapshots])
 #    preliminary: define cost as the average usage of all lines
-    cost = flow.abs().groupby(level='bus').mean()
-    return {"flow": flow, "cost": cost}
+#    cost = flow.abs().groupby(level='source').sum()
+#    return {"flow": flow, "cost": cost}
+    return flow.rename('allocation')
 
 
 def chord_diagram(allocation, lower_bound=0, groups=None, size=300,
@@ -700,8 +887,8 @@ def chord_diagram(allocation, lower_bound=0, groups=None, size=300,
 
     allocation : pandas.Series (MultiIndex)
         Series of power transmission between buses. The first index
-        level ('bus/source') represents the source of the flow, the second
-        level ('bus/sink') its sink.
+        level ('source') represents the source of the flow, the second
+        level ('sink') its sink.
     lower_bound : int, default is 0
         filter small power flows by a lower bound
     groups : pd.Series, default is None
@@ -726,18 +913,18 @@ def chord_diagram(allocation, lower_bound=0, groups=None, size=300,
     bus_map = pd.Series(range(len(allocated_buses)), index=allocated_buses)
 
     links = allocation.to_frame('value').reset_index()\
-        .replace({'bus/source': bus_map, 'bus/sink': bus_map})\
-        .sort_values('bus/source').reset_index(drop=True) \
+        .replace({'source': bus_map, 'sink': bus_map})\
+        .sort_values('source').reset_index(drop=True) \
         [lambda df: df.value >= lower_bound]
 
     nodes = pd.DataFrame({'bus': bus_map.index})
     if groups is None:
         cindex = 'index'
-        ecindex = 'bus/source'
+        ecindex = 'source'
     else:
         groups = groups.rename(index=bus_map)
         nodes = nodes.assign(groups=groups)
-        links = links.assign(groups=links['bus/source']
+        links = links.assign(groups=links['source']
                              .map(groups))
         cindex = 'groups'
         ecindex = 'groups'
