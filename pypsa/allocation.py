@@ -461,6 +461,10 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
                  .rename_axis(['component', 'branch_name', 'bus0', 'bus1'])])
                  .rename_axis(['component', 'branch_name', 'in', 'out']))
 
+        if normalized:
+            f_dir = (f_dir.groupby(level=['component', 'branch_name'])
+                     .transform(lambda ds: ds/ds.sum()))
+
         # signs of the absolute flow relativ to line direction
         f_sign = np.sign(f).set_axis(f.index.droplevel(['bus0', 'bus1']),
                                      inplace=0).rename('sign')
@@ -790,7 +794,8 @@ def marginal_welfare_contribution(n, snapshots=None, formulation='kirchhoff',
 
 
 
-def flow_allocation(n, snapshots, method='Average participation', **kwargs):
+def flow_allocation(n, snapshots, method='Average participation',
+                    to_csv=False, from_csv=False, **kwargs):
     """
     Function to allocate the total network flow to buses. Available
     methods are 'Average participation' ('ap'), 'Marginal
@@ -862,10 +867,23 @@ def flow_allocation(n, snapshots, method='Average participation', **kwargs):
     if isinstance(snapshots, str):
         snapshots = [snapshots]
 
-    flow = pd.concat([method_func(n, sn, **kwargs) for sn in snapshots])
-#    preliminary: define cost as the average usage of all lines
-#    cost = flow.abs().groupby(level='source').sum()
-#    return {"flow": flow, "cost": cost}
+
+    if to_csv:
+        assert isinstance(to_csv, str), ('Argument to_csv must be of type'
+                         ' string, inidicating the path')
+        for sn in snapshots:
+            if sn == snapshots[0]:
+                method_func(n, sn, **kwargs).to_csv(to_csv, header=True)
+            else:
+                method_func(n, sn, **kwargs).to_csv(to_csv,
+                            mode='a', header=False)
+        return
+
+    if from_csv:
+        flow = pd.read_csv(from_csv, index_col='snapshot', parse_dates=True)
+        flow = flow.set_index(list(flow.columns[:-1]), append=True).iloc[:,0]
+    else:
+        flow = pd.concat([method_func(n, sn, **kwargs) for sn in snapshots])
     return flow.rename('allocation')
 
 
