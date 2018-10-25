@@ -11,6 +11,7 @@ Created on Wed Feb 21 12:14:49 2018
 from .pf import calculate_PTDF, find_cycles
 from pandas import IndexSlice as idx
 import pandas as pd
+import dask.dataframe as dd
 import numpy as np
 import scipy as sp
 import logging
@@ -190,7 +191,8 @@ def power_production(n, snapshots=None,
         n.buses_t.p_plus = (sum(n.pnl(c).p.T
                             .clip_lower(0)
                             .assign(bus=n.df(c).bus)
-                            .groupby('bus').sum().T
+                            .groupby('bus').sum()
+                            .reindex(index=n.buses.index, fill_value=0).T
                             for c in components)
                             .rename_axis('source', axis=1)
                             .rename_axis('snapshot'))
@@ -206,16 +208,30 @@ def power_demand(n, snapshots=None,
                              .mul(n.df(c).sign, axis=0)
                              .clip_upper(0)
                              .assign(bus=n.df(c).bus)
-                             .groupby('bus').sum().T
+                             .groupby('bus').sum()
+                             .reindex(index=n.buses.index, fill_value=0).T
                              for c in components).abs()
                              .rename_axis('sink', axis=1)
                              .rename_axis('snapshot'))
     return n.buses_t.p_minus.loc[snapshots]
 
+def self_consumption(n, snapshots=None, override=False):
+    """
+    Inspection for self consumed power, i.e. power that is not injected in the
+    network and consumed by the bus itself
+    """
+    if snapshots is None:
+        snapshots = n.snapshots
+    if 'p_self' not in n.buses_t or override:
+        n.buses_t.p_self = (pd.concat([power_production(n, n.snapshots),
+                                       power_demand(n, n.snapshots)], axis=1)
+                            .groupby(level=0, axis=1).min())
+    return n.buses_t.p_self.loc[snapshots]
 
 
 def expand_by_source_type(ds, n,
-                          components=['Generator', 'StorageUnit']):
+                          components=['Generator', 'StorageUnit'],
+                          as_categoricals=True):
     """
     Breakdown allocation into generation carrier type. These include carriers
     of all components specified by 'components'. Note that carrier names of all
@@ -258,6 +274,11 @@ def expand_by_source_type(ds, n,
                              .transform(lambda ds: ds/ds.sum())
                              .swaplevel(axis=1)
                              .dropna(axis=1, how='all'))
+    if as_categoricals:
+        share_per_bus_carrier = (share_per_bus_carrier
+                                 .pipe(to_categorical_index, axis=1)
+                                 .pipe(set_categories_for_level,
+                                       ['source'], n.buses.index, axis=1))
 
     return (share_per_bus_carrier.unstack().dropna().reset_index(name='share')
             .merge(ds.reset_index(name='allocation'),
@@ -269,7 +290,8 @@ def expand_by_source_type(ds, n,
 
 
 def expand_by_sink_type(ds, n,
-                        components=['Load', 'StorageUnit']):
+                        components=['Load', 'StorageUnit'],
+                        as_categoricals=True):
     """
     Breakdown allocation into demand types, e.g. Storage carriers and Load.
     These include carriers of all components specified by 'components'. Note
@@ -316,6 +338,11 @@ def expand_by_sink_type(ds, n,
                              .transform(lambda ds: ds/ds.sum())
                              .swaplevel(axis=1))
 
+    if as_categoricals:
+        share_per_bus_carrier = (share_per_bus_carrier
+                                 .pipe(to_categorical_index, axis=1)
+                                 .pipe(set_categories_for_level,
+                                       ['sink'], n.buses.index, axis=1))
 
     return (share_per_bus_carrier.unstack().dropna().reset_index(name='share')
             .merge(ds.reset_index(name='allocation'),
@@ -325,6 +352,18 @@ def expand_by_sink_type(ds, n,
             .rename('allocation')
             .dropna().sort_index())
 
+def to_categorical_index(df, axis=0):
+    return df.set_axis(
+            df.axes[axis].set_levels([i.astype('category')
+            if i.is_object() else i for i in df.axes[axis].levels]),
+        inplace=False, axis=axis)
+
+def set_categories_for_level(df, level, categories, axis=0):
+    level = [level] if isinstance(level, str) else level
+    return df.set_axis(
+            df.axes[axis].set_levels([i.set_categories(categories)
+            if i.name in level else i for i in df.axes[axis].levels]),
+        inplace=False, axis=axis)
 
 # %%
 
@@ -390,7 +429,9 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
                 keys=branch_components, sort=True))
     f = (n.branches().assign(flow=f_in)
          .rename_axis(['component', 'branch_name'])
-         .set_index(['bus0', 'bus1'], append=True)['flow'])
+         .set_index(['bus0', 'bus1'], append=True)['flow']
+         .pipe(to_categorical_index)
+         .pipe(set_categories_for_level, ['bus0', 'bus1'], buses))
 
     p = network_injection(n, snapshot, branch_components).T
     K = incidence_matrix(n, branch_components)
@@ -433,19 +474,22 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
 #      (Q.T.dot(diag(p_out)).T == R.T.dot(diag(p_in))).all().all()
 
     if not normalized and per_bus:
+        Q = Q.mul(p_out[snapshot], axis=0)
+        R = R.mul(p_in[snapshot], axis=0)
         if aggregated:
-            Q = Q.mul(power_production(n, snapshot), axis=0)
-            R = R.mul(power_demand(n, snapshot), axis=0)
-        else:
-            Q = Q.mul(p_out[snapshot], axis=0)
-            R = R.mul(p_in[snapshot], axis=0)
+            # add self-consumption
+            Q += diag(self_consumption(n, snapshot))
+            R += diag(self_consumption(n, snapshot))
 
     q = (Q.rename_axis('in').rename_axis('source', axis=1)
          .stack()[lambda ds: ds != 0].swaplevel(0).sort_index()
-         .rename('upstream'))
+         .rename('upstream').pipe(to_categorical_index)
+         .pipe(set_categories_for_level, ['source', 'in'], buses))
 
     r = (R.rename_axis('out').rename_axis('sink', axis=1)
-         .stack()[lambda ds: ds != 0].sort_index().rename('downstream'))
+         .stack()[lambda ds: ds != 0].sort_index()
+         .rename('downstream').pipe(to_categorical_index)
+         .pipe(set_categories_for_level, ['out', 'sink'], buses))
 
 
     if per_bus:
@@ -794,8 +838,8 @@ def marginal_welfare_contribution(n, snapshots=None, formulation='kirchhoff',
 
 
 
-def flow_allocation(n, snapshots, method='Average participation',
-                    to_csv=False, from_csv=False, **kwargs):
+def flow_allocation(n, snapshots=None, method='Average participation',
+                    to_hdf=False, key=None, **kwargs):
     """
     Function to allocate the total network flow to buses. Available
     methods are 'Average participation' ('ap'), 'Marginal
@@ -864,26 +908,36 @@ def flow_allocation(n, snapshots, method='Average participation',
                          "'Virtual injection pattern',"
                          "'Least square color flows']"))
 
+    if snapshots is None:
+        snapshots = n.snapshots
     if isinstance(snapshots, str):
         snapshots = [snapshots]
 
+    def month_start_info(sn):
+        if sn.is_month_start & (sn.hour == 0):
+            logger.info('Allocating for %s %s'%(sn.month_name(), sn.year))
 
-    if to_csv:
-        assert isinstance(to_csv, str), ('Argument to_csv must be of type'
+
+    if to_hdf:
+        assert isinstance(to_hdf, str), ('Argument to_csv must be of type'
                          ' string, inidicating the path')
+        if key is None:
+            key = 'data'
+        store = pd.HDFStore(to_hdf)
+        if '/' + key in store.keys():
+            store.remove(key)
         for sn in snapshots:
-            if sn == snapshots[0]:
-                method_func(n, sn, **kwargs).to_csv(to_csv, header=True)
-            else:
-                method_func(n, sn, **kwargs).to_csv(to_csv,
-                            mode='a', header=False)
-        return
+            month_start_info(sn)
+            store.append(key, method_func(n, sn, **kwargs))
+        store.close()
+        return pd.read_hdf(to_hdf, key).pipe(to_categorical_index)
 
-    if from_csv:
-        flow = pd.read_csv(from_csv, index_col='snapshot', parse_dates=True)
-        flow = flow.set_index(list(flow.columns[:-1]), append=True).iloc[:,0]
     else:
-        flow = pd.concat([method_func(n, sn, **kwargs) for sn in snapshots])
+        month_start_info(snapshots[0])
+        flow = method_func(n, snapshots[0], **kwargs)
+        for sn in snapshots[1:]:
+            month_start_info(sn)
+            flow = flow.append(method_func(n, sn, **kwargs))
     return flow.rename('allocation')
 
 
