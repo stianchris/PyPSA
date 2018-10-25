@@ -365,6 +365,35 @@ def set_categories_for_level(df, level, categories, axis=0):
             if i.name in level else i for i in df.axes[axis].levels]),
         inplace=False, axis=axis)
 
+def parmap(f, arg_list, nprocs=None, **kwargs):
+    import multiprocessing
+
+    def fun(f, q_in, q_out):
+        while True:
+            i, x = q_in.get()
+            if i is None:
+                break
+            q_out.put((i, f(x)))
+
+    if nprocs is None:
+        nprocs = multiprocessing.cpu_count()
+    logger.info('Run process with {} parallel threads.'.format(nprocs))
+    q_in = multiprocessing.Queue(1)
+    q_out = multiprocessing.Queue()
+
+    proc = [multiprocessing.Process(target=fun, args=(f, q_in, q_out))
+            for _ in range(nprocs)]
+    for p in proc:
+        p.daemon = True
+        p.start()
+
+    sent = [q_in.put((i, x)) for i, x in enumerate(arg_list)]
+    [q_in.put((None, None)) for _ in range(nprocs)]
+    res = [q_out.get() for _ in range(len(sent))]
+    [p.join() for p in proc]
+    return [x for i, x in sorted(res)]
+
+
 # %%
 
 
@@ -839,7 +868,7 @@ def marginal_welfare_contribution(n, snapshots=None, formulation='kirchhoff',
 
 
 def flow_allocation(n, snapshots=None, method='Average participation',
-                    to_hdf=False, key=None, **kwargs):
+                    to_hdf=False, key=None, parallelized=False, **kwargs):
     """
     Function to allocate the total network flow to buses. Available
     methods are 'Average participation' ('ap'), 'Marginal
@@ -933,11 +962,15 @@ def flow_allocation(n, snapshots=None, method='Average participation',
         return pd.read_hdf(to_hdf, key).pipe(to_categorical_index)
 
     else:
-        month_start_info(snapshots[0])
-        flow = method_func(n, snapshots[0], **kwargs)
-        for sn in snapshots[1:]:
-            month_start_info(sn)
-            flow = flow.append(method_func(n, sn, **kwargs))
+        if parallelized:
+            f = lambda sn: method_func(n, sn, **kwargs)
+            flow = pd.concat(parmap(f, snapshots))
+        else:
+            month_start_info(snapshots[0])
+            flow = method_func(n, snapshots[0], **kwargs)
+            for sn in snapshots[1:]:
+                month_start_info(sn)
+                flow = flow.append(method_func(n, sn, **kwargs))
     return flow.rename('allocation')
 
 
