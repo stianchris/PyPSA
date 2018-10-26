@@ -149,6 +149,7 @@ def plot(n, margin=0.05, ax=None, basemap=True, bus_colors='grey',
             ax = plt.gca()
     else:
         if cartopy_present and basemap:
+            import cartopy.mpl.geoaxes
             assert isinstance(ax, cartopy.mpl.geoaxes.GeoAxesSubplot), (
                     'The passed axis is not a GeoAxesSubplot. You can '
                     'create one with: \nimport cartopy.crs as ccrs \n'
@@ -390,6 +391,8 @@ def directed_flow(n, flow, flow_scale=None, ax=None, line_colors='darkgreen',
         flow_scale = 1
     if ax is None:
         ax = plt.gca()
+    # align index level names
+    flow_scale.index.names = flow.index.names
 #    set the scale of the arrowsizes
     fdata = pd.concat([pd.DataFrame(
                       {'x1': n.df(l).bus0.map(n.buses.x),

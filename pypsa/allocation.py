@@ -184,7 +184,8 @@ def is_balanced(n, tol=1e-9):
 
 
 def power_production(n, snapshots=None,
-                     components=['Generator', 'StorageUnit'], override=False):
+                     components=['Generator', 'StorageUnit'],
+                     per_carrier=False, override=False):
     if snapshots is None:
         snapshots = n.snapshots
     if 'p_plus' not in n.buses_t or override:
@@ -196,11 +197,23 @@ def power_production(n, snapshots=None,
                             for c in components)
                             .rename_axis('source', axis=1)
                             .rename_axis('snapshot'))
+    if 'p_plus_per_carrier' not in n.buses_t or override:
+        n.buses_t.p_plus_per_carrier =  (
+                pd.concat([(n.pnl(c).p.T
+                .assign(carrier=n.df(c).carrier, bus=n.df(c).bus)
+                .groupby(['bus', 'carrier']).sum().T
+                .where(lambda x: x > 0)) for c in components], axis=1)
+                .rename_axis(['snapshot'])
+                .rename_axis(['source', 'sourcetype'], axis=1))
+
+    if per_carrier:
+        return n.buses_t.p_plus_per_carrier.loc[snapshots]
     return n.buses_t.p_plus.loc[snapshots]
 
 
 def power_demand(n, snapshots=None,
-                 components=['Load', 'StorageUnit'], override=False):
+                 components=['Load', 'StorageUnit'],
+                 per_carrier=False, override=False):
     if snapshots is None:
         snapshots = n.snapshots
     if 'p_minus' not in n.buses_t or override:
@@ -213,7 +226,29 @@ def power_demand(n, snapshots=None,
                              for c in components).abs()
                              .rename_axis('sink', axis=1)
                              .rename_axis('snapshot'))
+
+    if 'p_minus_per_carrier' not in n.buses_t or override:
+        if components == ['Generator', 'StorageUnit']:
+            intersc = (pd.Index(n.storage_units.carrier.unique())
+                       .intersection(pd.Index(n.generators.carrier.unique())))
+            assert (intersc.empty), (
+                    'Carrier names {} of compoents are not unique'
+                    .format(intersc))
+        n.loads = n.loads.assign(carrier = 'load')
+        n.buses_t.p_minus_per_carrier =  -(
+                pd.concat([(n.pnl(c).p.T
+                .mul(n.df(c).sign, axis=0)
+                .assign(carrier=n.df(c).carrier, bus=n.df(c).bus)
+                .groupby(['bus', 'carrier']).sum().T
+                .where(lambda x: x < 0)) for c in components], axis=1)
+                .rename_axis(['snapshot'])
+                .rename_axis(['sink', 'sinktype'], axis=1))
+        n.loads = n.loads.drop(columns='carrier')
+
+    if per_carrier:
+        return n.buses_t.p_minus_per_carrier.loc[snapshots]
     return n.buses_t.p_minus.loc[snapshots]
+
 
 def self_consumption(n, snapshots=None, override=False):
     """
@@ -257,23 +292,10 @@ def expand_by_source_type(ds, n,
 
     """
     sns = ds.index.unique('snapshot')
-    if components == ['Generator', 'StorageUnit']:
-        intersc = (pd.Index(n.storage_units.carrier.unique())
-                   .intersection(pd.Index(n.generators.carrier.unique())))
-        assert (intersc.empty), (
-                'Carrier names {} of compoents are not unique'.format(intersc))
-    p_in_per_bus_carrier = [(n.pnl(c).p.loc[sns].T
-                            .assign(carrier=n.df(c).carrier, bus=n.df(c).bus)
-                            .groupby(['bus', 'carrier']).sum().T
-                            .where(lambda x: x > 0)) for c in components]
-
-    share_per_bus_carrier = (pd.concat(p_in_per_bus_carrier, axis=1)
-                             .rename_axis(['snapshot'])
-                             .rename_axis(['source', 'sourcetype'], axis=1)
-                             .groupby(level='source', axis=1)
-                             .transform(lambda ds: ds/ds.sum())
-                             .swaplevel(axis=1)
-                             .dropna(axis=1, how='all'))
+    share_per_bus_carrier = (power_production(n, sns, per_carrier=True)
+                             .div(power_production(n, sns),
+                                  level='source')
+                             .swaplevel(axis=1))
     if as_categoricals:
         share_per_bus_carrier = (share_per_bus_carrier
                                  .pipe(to_categorical_index, axis=1)
@@ -286,7 +308,7 @@ def expand_by_source_type(ds, n,
             .set_index(['snapshot', 'sourcetype'] + ds.index.names[1:])
             .eval('allocation * share')
             .rename('allocation')
-            .dropna().sort_index())
+            .dropna())
 
 
 def expand_by_sink_type(ds, n,
@@ -317,25 +339,9 @@ def expand_by_sink_type(ds, n,
 
     """
     sns = ds.index.unique('snapshot')
-
-    n.loads = n.loads.assign(carrier = 'load')
-    n.loads_t.p *= -1
-
-    p_out_per_bus_carrier = [(n.pnl(c).p.loc[sns].T
-                             .assign(carrier=n.df(c).carrier, bus=n.df(c).bus)
-                             .groupby(['bus', 'carrier']).sum().T
-                             .where(lambda x: x < 0)) for c in
-                             components]
-
-    n.loads = n.loads.drop(columns='carrier')
-    n.loads_t.p *= -1
-
-
-    share_per_bus_carrier = (pd.concat(p_out_per_bus_carrier, axis=1)
-                             .rename_axis(['snapshot'])
-                             .rename_axis(['sink', 'sinktype'], axis=1)
-                             .groupby(level='sink', axis=1)
-                             .transform(lambda ds: ds/ds.sum())
+    share_per_bus_carrier = (power_demand(n, sns, per_carrier=True)
+                             .div(power_demand(n, sns),
+                                  level='sink')
                              .swaplevel(axis=1))
 
     if as_categoricals:
@@ -350,7 +356,8 @@ def expand_by_sink_type(ds, n,
             .set_index(['snapshot', 'sinktype'] + ds.index.names[1:])
             .eval('allocation * share')
             .rename('allocation')
-            .dropna().sort_index())
+            .dropna())
+
 
 def to_categorical_index(df, axis=0):
     return df.set_axis(
@@ -868,7 +875,8 @@ def marginal_welfare_contribution(n, snapshots=None, formulation='kirchhoff',
 
 
 def flow_allocation(n, snapshots=None, method='Average participation',
-                    to_hdf=False, key=None, parallelized=False, **kwargs):
+                    to_hdf=False, key=None, parallelized=False, nprocs=None,
+                    **kwargs):
     """
     Function to allocate the total network flow to buses. Available
     methods are 'Average participation' ('ap'), 'Marginal
@@ -964,7 +972,7 @@ def flow_allocation(n, snapshots=None, method='Average participation',
     else:
         if parallelized:
             f = lambda sn: method_func(n, sn, **kwargs)
-            flow = pd.concat(parmap(f, snapshots))
+            flow = pd.concat(parmap(f, snapshots, nprocs=nprocs))
         else:
             month_start_info(snapshots[0])
             flow = method_func(n, snapshots[0], **kwargs)
