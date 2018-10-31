@@ -11,7 +11,6 @@ Created on Wed Feb 21 12:14:49 2018
 from .pf import calculate_PTDF, find_cycles
 from pandas import IndexSlice as idx
 import pandas as pd
-import dask.dataframe as dd
 import numpy as np
 import scipy as sp
 import logging
@@ -360,10 +359,34 @@ def expand_by_sink_type(ds, n,
 
 
 def to_categorical_index(df, axis=0):
-    return df.set_axis(
-            df.axes[axis].set_levels([i.astype('category')
-            if i.is_object() else i for i in df.axes[axis].levels]),
-        inplace=False, axis=axis)
+    to_cat_if_obj = lambda i: (i.astype('category')
+                                          if i.is_object() else i)
+    if df.axes[axis].nlevels > 1:
+        return df.set_axis(
+                df.axes[axis]
+                    .set_levels([to_cat_if_obj(i) for i
+                                 in df.axes[axis].levels]),
+                inplace=False, axis=axis)
+    else:
+        if df.axes[axis].is_object():
+            return df.set_axis(to_cat_if_obj(df.axes[axis]),
+                inplace=False, axis=axis)
+
+def to_categorical_axes(df):
+    return (df.pipe(to_categorical_index, axis=0)
+              .pipe(to_categorical_index, axis=1))
+
+def sync_categrorical_axis(df1, df2, axis=0):
+    overlap_levels = [n for n in df1.axes[axis].names
+                      if n in df2.axes[axis].names and
+                      (df1.axes[axis].unique(n).is_categorical() &
+                       df2.axes[axis].unique(n).is_categorical())]
+    union = [df1.axes[axis].unique(n).union(df2.axes[axis].unique(n))
+             .categories for n in overlap_levels]
+    for level, cats in zip(overlap_levels, union):
+        df1 = df1.pipe(set_categories_for_level, level, cats, axis=axis)
+        df2 = df2.pipe(set_categories_for_level, level, cats, axis=axis)
+
 
 def set_categories_for_level(df, level, categories, axis=0):
     level = [level] if isinstance(level, str) else level
