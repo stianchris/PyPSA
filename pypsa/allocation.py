@@ -261,7 +261,8 @@ def self_consumption(n, snapshots=None, override=False):
 
 def expand_by_source_type(ds, n,
                           components=['Generator', 'StorageUnit'],
-                          as_categoricals=True):
+                          as_categoricals=True,
+                          use_dask=False):
     """
     Breakdown allocation into generation carrier type. These include carriers
     of all components specified by 'components'. Note that carrier names of all
@@ -297,6 +298,22 @@ def expand_by_source_type(ds, n,
                                  .pipe(set_categories_for_level,
                                        ['source'], n.buses.index, axis=1))
 
+    if use_dask:
+        import dask.dataframe as dd
+        npartitions = lambda df: 1+df.memory_usage(deep=True) // 100e6
+        share_per_bus_carrier = share_per_bus_carrier.unstack()\
+                                    .dropna().reset_index(name='share')
+
+        share_per_bus_carrier = dd.from_pandas(share_per_bus_carrier,
+                                npartitions=npartitions(share_per_bus_carrier))
+        ds = ds.reset_index(name='allocation')
+        dds = dd.from_pandas(ds, npartitions=npartitions(ds))
+        temp = (share_per_bus_carrier.merge(dds, on=['snapshot', 'source']))
+        temp['allocation'] = temp['allocation'] * temp['share']
+        return temp.compute()\
+                .set_index(['snapshot', 'sourcetype'] + ds.index.names[1:])\
+                .allocation.dropna()
+
     return (share_per_bus_carrier.unstack().dropna().reset_index(name='share')
             .merge(ds.reset_index(name='allocation'),
                    on=['snapshot', 'source'])
@@ -306,9 +323,8 @@ def expand_by_source_type(ds, n,
             .dropna())
 
 
-def expand_by_sink_type(ds, n,
-                        components=['Load', 'StorageUnit'],
-                        as_categoricals=True):
+def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
+                        as_categoricals=True, use_dask=False):
     """
     Breakdown allocation into demand types, e.g. Storage carriers and Load.
     These include carriers of all components specified by 'components'. Note
@@ -344,6 +360,22 @@ def expand_by_sink_type(ds, n,
                                  .pipe(to_categorical_index, axis=1)
                                  .pipe(set_categories_for_level,
                                        ['sink'], n.buses.index, axis=1))
+
+    if use_dask:
+        import dask.dataframe as dd
+        npartitions = lambda df: 1+df.memory_usage(deep=True) // 100e6
+        share_per_bus_carrier = share_per_bus_carrier.unstack()\
+                                    .dropna().reset_index(name='share')
+
+        share_per_bus_carrier = dd.from_pandas(share_per_bus_carrier,
+                                npartitions=npartitions(share_per_bus_carrier))
+        ds = ds.reset_index(name='allocation')
+        dds = dd.from_pandas(ds, npartitions=npartitions(ds))
+        temp = (share_per_bus_carrier.merge(dds, on=['snapshot', 'source']))
+        temp['allocation'] = temp['allocation'] * temp['share']
+        return temp.compute()\
+                .set_index(['snapshot', 'sourcetype'] + ds.index.names[1:])\
+                .allocation.dropna()
 
     return (share_per_bus_carrier.unstack().dropna().reset_index(name='share')
             .merge(ds.reset_index(name='allocation'),
