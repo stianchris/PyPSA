@@ -334,7 +334,7 @@ def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
     ----------
 
     ds : pd.Series
-        Allocation Series with at least index level 'source'
+        Allocation Series with at least index level 'sink'
     n : pypsa.Network()
         Network which the allocation was derived from
     components : list, default ['Load', 'StorageUnit']
@@ -371,10 +371,10 @@ def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
                                 npartitions=npartitions(share_per_bus_carrier))
         ds = ds.reset_index(name='allocation')
         dds = dd.from_pandas(ds, npartitions=npartitions(ds))
-        temp = (share_per_bus_carrier.merge(dds, on=['snapshot', 'source']))
+        temp = (share_per_bus_carrier.merge(dds, on=['snapshot', 'sink']))
         temp['allocation'] = temp['allocation'] * temp['share']
         return temp.compute()\
-               .set_index(['snapshot', 'sourcetype'] + list(ds.columns[1:-1]))\
+               .set_index(['snapshot', 'sinktype'] + list(ds.columns[1:-1]))\
                .allocation.dropna()
 
     return (share_per_bus_carrier.unstack().dropna().reset_index(name='share')
