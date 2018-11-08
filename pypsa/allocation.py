@@ -259,10 +259,9 @@ def self_consumption(n, snapshots=None, override=False):
     return n.buses_t.p_self.loc[snapshots]
 
 
-def expand_by_source_type(ds, n,
-                          components=['Generator', 'StorageUnit'],
-                          as_categoricals=True,
-                          use_dask=False):
+def expand_by_source_type(ds, n, components=['Generator', 'StorageUnit'],
+                          as_categoricals=True, use_dask=False,
+                          cut_lower_share=0.001):
     """
     Breakdown allocation into generation carrier type. These include carriers
     of all components specified by 'components'. Note that carrier names of all
@@ -294,6 +293,7 @@ def expand_by_source_type(ds, n,
                              .swaplevel(axis=1))
     if as_categoricals:
         share_per_bus_carrier = (share_per_bus_carrier
+                                 [lambda x: x>cut_lower_share]
                                  .pipe(to_categorical_index, axis=1)
                                  .pipe(set_categories_for_level,
                                        ['source'], n.buses.index, axis=1))
@@ -324,7 +324,8 @@ def expand_by_source_type(ds, n,
 
 
 def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
-                        as_categoricals=True, use_dask=False):
+                        as_categoricals=True, use_dask=False,
+                        cut_lower_share=0.001):
     """
     Breakdown allocation into demand types, e.g. Storage carriers and Load.
     These include carriers of all components specified by 'components'. Note
@@ -364,7 +365,8 @@ def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
     if use_dask:
         import dask.dataframe as dd
         npartitions = lambda df: 1+df.memory_usage(deep=True).sum() // 100e6
-        share_per_bus_carrier = share_per_bus_carrier.unstack()\
+        share_per_bus_carrier = share_per_bus_carrier\
+                                    [lambda x: x>cut_lower_share].unstack()\
                                     .dropna().reset_index(name='share')
 
         share_per_bus_carrier = dd.from_pandas(share_per_bus_carrier,
