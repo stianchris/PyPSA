@@ -159,7 +159,7 @@ def network_injection(n, snapshots=None, branch_components=['Link', 'Line']):
                                 .reindex(columns=n.buses.index, fill_value=0)
                                 for l in ['Link', 'Line'] for i in [0, 1])
                                 .round(10))
-        return n.buses_t['p_n'].loc[snapshots]
+        return n.buses_t['p_n'].loc[snapshots].rename_axis('snapshot')
     elif branch_components == ['Link']:
         if 'p_link' not in n.buses_t.keys():
             n.buses_t['p_link'] = (sum(n.pnl(l)['p{}'.format(i)]
@@ -169,7 +169,7 @@ def network_injection(n, snapshots=None, branch_components=['Link', 'Line']):
                                             fill_value=0)
                                    for l in ['Link'] for i in [0, 1])
                                    .round(10))
-        return n.buses_t['p_link'].loc[snapshots]
+        return n.buses_t['p_link'].loc[snapshots].rename_axis('snapshot')
 
 
 def is_balanced(n, tol=1e-9):
@@ -184,25 +184,23 @@ def is_balanced(n, tol=1e-9):
 
 def power_production(n, snapshots=None,
                      components=['Generator', 'StorageUnit'],
-                     per_carrier=False, override=False):
+                     per_carrier=False, update=False):
     if snapshots is None:
-        snapshots = n.snapshots
-    if 'p_plus' not in n.buses_t or override:
+        snapshots = n.snapshots.rename('snapshot')
+    if 'p_plus' not in n.buses_t or update:
         n.buses_t.p_plus = (sum(n.pnl(c).p.T
                             .clip_lower(0)
                             .assign(bus=n.df(c).bus)
                             .groupby('bus').sum()
                             .reindex(index=n.buses.index, fill_value=0).T
                             for c in components)
-                            .rename_axis('source', axis=1)
-                            .rename_axis('snapshot'))
-    if 'p_plus_per_carrier' not in n.buses_t or override:
+                            .rename_axis('source', axis=1))
+    if 'p_plus_per_carrier' not in n.buses_t or update:
         n.buses_t.p_plus_per_carrier =  (
                 pd.concat([(n.pnl(c).p.T
                 .assign(carrier=n.df(c).carrier, bus=n.df(c).bus)
                 .groupby(['bus', 'carrier']).sum().T
                 .where(lambda x: x > 0)) for c in components], axis=1)
-                .rename_axis(['snapshot'])
                 .rename_axis(['source', 'sourcetype'], axis=1))
 
     if per_carrier:
@@ -212,10 +210,10 @@ def power_production(n, snapshots=None,
 
 def power_demand(n, snapshots=None,
                  components=['Load', 'StorageUnit'],
-                 per_carrier=False, override=False):
+                 per_carrier=False, update=False):
     if snapshots is None:
-        snapshots = n.snapshots
-    if 'p_minus' not in n.buses_t or override:
+        snapshots = n.snapshots.rename('snapshot')
+    if 'p_minus' not in n.buses_t or update:
         n.buses_t.p_minus = (sum(n.pnl(c).p.T
                              .mul(n.df(c).sign, axis=0)
                              .clip_upper(0)
@@ -223,10 +221,9 @@ def power_demand(n, snapshots=None,
                              .groupby('bus').sum()
                              .reindex(index=n.buses.index, fill_value=0).T
                              for c in components).abs()
-                             .rename_axis('sink', axis=1)
-                             .rename_axis('snapshot'))
+                             .rename_axis('sink', axis=1))
 
-    if 'p_minus_per_carrier' not in n.buses_t or override:
+    if 'p_minus_per_carrier' not in n.buses_t or update:
         if components == ['Generator', 'StorageUnit']:
             intersc = (pd.Index(n.storage_units.carrier.unique())
                        .intersection(pd.Index(n.generators.carrier.unique())))
@@ -240,7 +237,6 @@ def power_demand(n, snapshots=None,
                 .assign(carrier=n.df(c).carrier, bus=n.df(c).bus)
                 .groupby(['bus', 'carrier']).sum().T
                 .where(lambda x: x < 0)) for c in components], axis=1)
-                .rename_axis(['snapshot'])
                 .rename_axis(['sink', 'sinktype'], axis=1))
         n.loads = n.loads.drop(columns='carrier')
 
@@ -255,7 +251,7 @@ def self_consumption(n, snapshots=None, override=False):
     network and consumed by the bus itself
     """
     if snapshots is None:
-        snapshots = n.snapshots
+        snapshots = n.snapshots.rename('snapshot')
     if 'p_self' not in n.buses_t or override:
         n.buses_t.p_self = (pd.concat([power_production(n, n.snapshots),
                                        power_demand(n, n.snapshots)], axis=1)
@@ -541,12 +537,12 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
             R += diag(self_consumption(n, snapshot))
 
     q = (Q.rename_axis('in').rename_axis('source', axis=1)
-         .stack()[lambda ds: ds != 0].swaplevel(0).sort_index()
+         .stack()[lambda ds: ds != 0].swaplevel(0)#.sort_index()
          .rename('upstream').pipe(to_categorical_index)
          .pipe(set_categories_for_level, ['source', 'in'], buses))
 
     r = (R.rename_axis('out').rename_axis('sink', axis=1)
-         .stack()[lambda ds: ds != 0].sort_index()
+         .stack()[lambda ds: ds != 0]#.sort_index()
          .rename('downstream').pipe(to_categorical_index)
          .pipe(set_categories_for_level, ['out', 'sink'], buses))
 
@@ -579,7 +575,7 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
              .merge(r.reset_index(), on='out')
              .merge(f_sign.reset_index(), on=['component', 'branch_name'])
              .set_index(['source', 'sink', 'component', 'branch_name'])
-             .eval('upstream * flow *  downstream * sign').sort_index())
+             .eval('upstream * flow *  downstream * sign'))
 
     return pd.concat([T], keys=[snapshot], names=['snapshot'])
 
