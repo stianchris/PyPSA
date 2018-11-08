@@ -300,7 +300,7 @@ def expand_by_source_type(ds, n,
 
     if use_dask:
         import dask.dataframe as dd
-        npartitions = lambda df: 1+df.memory_usage(deep=True) // 100e6
+        npartitions = lambda df: 1+df.memory_usage(deep=True).sum() // 100e6
         share_per_bus_carrier = share_per_bus_carrier.unstack()\
                                     .dropna().reset_index(name='share')
 
@@ -311,8 +311,8 @@ def expand_by_source_type(ds, n,
         temp = (share_per_bus_carrier.merge(dds, on=['snapshot', 'source']))
         temp['allocation'] = temp['allocation'] * temp['share']
         return temp.compute()\
-                .set_index(['snapshot', 'sourcetype'] + ds.index.names[1:])\
-                .allocation.dropna()
+               .set_index(['snapshot', 'sourcetype'] + list(ds.columns[1:-1]))\
+               .allocation.dropna()
 
     return (share_per_bus_carrier.unstack().dropna().reset_index(name='share')
             .merge(ds.reset_index(name='allocation'),
@@ -363,7 +363,7 @@ def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
 
     if use_dask:
         import dask.dataframe as dd
-        npartitions = lambda df: 1+df.memory_usage(deep=True) // 100e6
+        npartitions = lambda df: 1+df.memory_usage(deep=True).sum() // 100e6
         share_per_bus_carrier = share_per_bus_carrier.unstack()\
                                     .dropna().reset_index(name='share')
 
@@ -374,8 +374,8 @@ def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
         temp = (share_per_bus_carrier.merge(dds, on=['snapshot', 'source']))
         temp['allocation'] = temp['allocation'] * temp['share']
         return temp.compute()\
-                .set_index(['snapshot', 'sourcetype'] + ds.index.names[1:])\
-                .allocation.dropna()
+               .set_index(['snapshot', 'sourcetype'] + list(ds.columns[1:-1]))\
+               .allocation.dropna()
 
     return (share_per_bus_carrier.unstack().dropna().reset_index(name='share')
             .merge(ds.reset_index(name='allocation'),
