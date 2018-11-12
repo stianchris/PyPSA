@@ -261,7 +261,7 @@ def self_consumption(n, snapshots=None, override=False):
 
 def expand_by_source_type(ds, n, components=['Generator', 'StorageUnit'],
                           as_categoricals=True, use_dask=False,
-                          cut_lower_share=0.00):
+                          cut_lower_share=1e-5):
     """
     Breakdown allocation into generation carrier type. These include carriers
     of all components specified by 'components'. Note that carrier names of all
@@ -300,21 +300,23 @@ def expand_by_source_type(ds, n, components=['Generator', 'StorageUnit'],
 
     share_per_bus_carrier = share_per_bus_carrier\
                                 [lambda x: x>cut_lower_share].unstack()\
-                                .dropna().reset_index(name='share')\
-                                .pipe(to_dask, use_dask)
+                                .dropna()\
+                                .reset_index(['sourcetype', 'source'],
+                                              name='share')
 
-    ds = ds.reset_index(name='allocation').pipe(to_dask)
-    return share_per_bus_carrier.merge(ds, on=['snapshot', 'source']) \
+    ds = ds.reset_index(ds.index.names[1:], name='allocation')\
+           .pipe(to_dask, use_dask)
+    return ds.merge(share_per_bus_carrier, on=['snapshot', 'source']) \
             .eval('allocation = allocation * share') \
             .pipe(compute_if_dask, use_dask) \
-            .set_index(['snapshot', 'sourcetype'] + list(ds.columns[1:-1]))\
+            .set_index(['sourcetype'] + list(ds.columns[:-1]), append=True)\
             .allocation.dropna()\
             .sort_index(level=0, sort_remaining=False)
 
 
 def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
                         as_categoricals=True, use_dask=False,
-                        cut_lower_share=0.00):
+                        cut_lower_share=1e-5):
     """
     Breakdown allocation into demand types, e.g. Storage carriers and Load.
     These include carriers of all components specified by 'components'. Note
@@ -353,14 +355,16 @@ def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
 
     share_per_bus_carrier = share_per_bus_carrier\
                                 [lambda x: x>cut_lower_share].unstack()\
-                                .dropna().reset_index(name='share')\
-                                .pipe(to_dask, use_dask)
+                                .dropna()\
+                                .reset_index(['sinktype', 'sink'],
+                                              name='share')
 
-    ds = ds.reset_index(name='allocation').pipe(to_dask)
-    return share_per_bus_carrier.merge(ds, on=['snapshot', 'sink']) \
+    ds = ds.reset_index(ds.index.names[1:], name='allocation')\
+           .pipe(to_dask, use_dask)
+    return ds.merge(share_per_bus_carrier, on=['snapshot', 'sink']) \
             .eval('allocation = allocation * share') \
             .pipe(compute_if_dask, use_dask) \
-            .set_index(['snapshot', 'sinktype'] + list(ds.columns[1:-1]))\
+            .set_index(['sinktype'] + list(ds.columns[:-1]), append=True)\
             .allocation.dropna()\
             .sort_index(level=0, sort_remaining=False)
 
@@ -371,8 +375,11 @@ compute_if_dask = lambda df, b: df.compute() if b else df
 def to_dask(df, use_dask=False):
     if use_dask:
         import dask.dataframe as dd
-        npartitions = 1+df.memory_usage(deep=True).sum() // 100e6
-        return dd.from_pandas(df, npartitions=npartitions)
+        if df.index.names[0] == 'snapshot':
+            return dd.from_pandas(df, npartitions=1).repartition(freq='1m')
+        else:
+            npartitions = 1+df.memory_usage(deep=True).sum() // 100e6
+            return dd.from_pandas(df, npartitions=npartitions)
     else:
         return df
 
@@ -572,7 +579,8 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
 
     if per_bus:
         T = (pd.concat([q,r], axis=0, keys=['upstream', 'downstream'],
-                       names=['method', 'source', 'sink']))
+                       names=['method', 'source', 'sink'])
+             .rename('allocation'))
         if downstream is not None:
             T = T.downstream if downstream else T.upstream
 
