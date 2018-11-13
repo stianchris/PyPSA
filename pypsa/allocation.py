@@ -261,7 +261,7 @@ def self_consumption(n, snapshots=None, override=False):
 
 def expand_by_source_type(ds, n, components=['Generator', 'StorageUnit'],
                           as_categoricals=True, use_dask=False,
-                          cut_lower_share=1e-5):
+                          cut_lower_share=1e-5, **merge_kwargs):
     """
     Breakdown allocation into generation carrier type. These include carriers
     of all components specified by 'components'. Note that carrier names of all
@@ -307,7 +307,7 @@ def expand_by_source_type(ds, n, components=['Generator', 'StorageUnit'],
     ds = ds.reset_index(ds.index.names[1:], name='allocation')\
            .pipe(to_dask, use_dask)
     return ds.merge(share_per_bus_carrier, on=['snapshot', 'source'],
-                    copy=False) \
+                    **merge_kwargs) \
             .eval('allocation = allocation * share') \
             .pipe(compute_if_dask, use_dask) \
             .set_index(['sourcetype'] + list(ds.columns[:-1]), append=True)\
@@ -317,7 +317,7 @@ def expand_by_source_type(ds, n, components=['Generator', 'StorageUnit'],
 
 def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
                         as_categoricals=True, use_dask=False,
-                        cut_lower_share=1e-5):
+                        cut_lower_share=1e-5, **merge_kwargs):
     """
     Breakdown allocation into demand types, e.g. Storage carriers and Load.
     These include carriers of all components specified by 'components'. Note
@@ -362,7 +362,8 @@ def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
 
     ds = ds.reset_index(ds.index.names[1:], name='allocation')\
            .pipe(to_dask, use_dask)
-    return ds.merge(share_per_bus_carrier, on=['snapshot', 'sink'], copy=False) \
+    return ds.merge(share_per_bus_carrier, on=['snapshot', 'sink'],
+                    **merge_kwargs)\
             .eval('allocation = allocation * share') \
             .pipe(compute_if_dask, use_dask) \
             .set_index(['sinktype'] + list(ds.columns[:-1]), append=True)\
