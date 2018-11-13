@@ -306,7 +306,8 @@ def expand_by_source_type(ds, n, components=['Generator', 'StorageUnit'],
 
     ds = ds.reset_index(ds.index.names[1:], name='allocation')\
            .pipe(to_dask, use_dask)
-    return ds.merge(share_per_bus_carrier, on=['snapshot', 'source']) \
+    return ds.merge(share_per_bus_carrier, on=['snapshot', 'source'],
+                    copy=False) \
             .eval('allocation = allocation * share') \
             .pipe(compute_if_dask, use_dask) \
             .set_index(['sourcetype'] + list(ds.columns[:-1]), append=True)\
@@ -361,7 +362,7 @@ def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
 
     ds = ds.reset_index(ds.index.names[1:], name='allocation')\
            .pipe(to_dask, use_dask)
-    return ds.merge(share_per_bus_carrier, on=['snapshot', 'sink']) \
+    return ds.merge(share_per_bus_carrier, on=['snapshot', 'sink'], copy=False) \
             .eval('allocation = allocation * share') \
             .pipe(compute_if_dask, use_dask) \
             .set_index(['sinktype'] + list(ds.columns[:-1]), append=True)\
