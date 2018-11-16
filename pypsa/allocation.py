@@ -1023,7 +1023,7 @@ def flow_allocation(n, snapshots=None, method='Average participation',
             month_start_info(sn)
             store.append(key, method_func(n, sn, **kwargs))
         store.close()
-        return pd.read_hdf(to_hdf, key).pipe(to_categorical_index)
+        return pd.read_hdf(to_hdf, key).pipe(set_cats, n)
 
     else:
         if parallelized:
