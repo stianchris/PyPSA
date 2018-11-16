@@ -386,7 +386,7 @@ def to_dask(df, use_dask=False):
         return df
 
 
-def to_categorical_index(df, axis=0):
+def _to_categorical_index(df, axis=0):
     to_cat_if_obj = lambda i: (i.astype('category')
                                           if i.is_object() else i)
     if df.axes[axis].nlevels > 1:
@@ -400,11 +400,8 @@ def to_categorical_index(df, axis=0):
             return df.set_axis(to_cat_if_obj(df.axes[axis]),
                 inplace=False, axis=axis)
 
-def to_categorical_axes(df):
-    return (df.pipe(to_categorical_index, axis=0)
-              .pipe(to_categorical_index, axis=1))
 
-def sync_categrorical_axis(df1, df2, axis=0):
+def _sync_categrorical_axis(df1, df2, axis=0):
     overlap_levels = [n for n in df1.axes[axis].names
                       if n in df2.axes[axis].names and
                       (df1.axes[axis].unique(n).is_categorical() &
@@ -412,16 +409,32 @@ def sync_categrorical_axis(df1, df2, axis=0):
     union = [df1.axes[axis].unique(n).union(df2.axes[axis].unique(n))
              .categories for n in overlap_levels]
     for level, cats in zip(overlap_levels, union):
-        df1 = df1.pipe(set_categories_for_level, level, cats, axis=axis)
-        df2 = df2.pipe(set_categories_for_level, level, cats, axis=axis)
+        df1 = df1.pipe(_set_categories_for_level, level, cats, axis=axis)
+        df2 = df2.pipe(_set_categories_for_level, level, cats, axis=axis)
 
 
-def set_categories_for_level(df, level, categories, axis=0):
+def _set_categories_for_level(df, level, categories, axis=0):
     level = [level] if isinstance(level, str) else level
     return df.set_axis(
             df.axes[axis].set_levels([i.set_categories(categories)
             if i.name in level else i for i in df.axes[axis].levels]),
         inplace=False, axis=axis)
+
+
+def set_cats(df, n=None):
+    """
+    Helper function for converting index of allocation series to categoricals.
+    If a network is passed the categories will be aligned to the components
+    of the network.
+    """
+    if n is None:
+        return df.pipe(_to_categorical_index)
+    buses = n.buses.index
+    branch_names = n.branches().index.levels[1]
+    return df.pipe(_to_categorical_index)\
+             .pipe(_set_categories_for_level, ['sink', 'source'], buses)\
+             .pipe(_set_categories_for_level, ['branch_name'], branch_names)
+
 
 def parmap(f, arg_list, nprocs=None, **kwargs):
     import multiprocessing
