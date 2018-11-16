@@ -292,17 +292,13 @@ def expand_by_source_type(ds, n, components=['Generator', 'StorageUnit'],
                                   level='source')
                              .swaplevel(axis=1))
     if as_categoricals:
-        share_per_bus_carrier = (share_per_bus_carrier
-                                 [lambda x: x>cut_lower_share]
-                                 .pipe(to_categorical_index, axis=1)
-                                 .pipe(set_categories_for_level,
-                                       ['source'], n.buses.index, axis=1))
+        share_per_bus_carrier = share_per_bus_carrier.pipe(set_cats, n, axis=1)
 
     share_per_bus_carrier = share_per_bus_carrier\
-                                [lambda x: x>cut_lower_share].unstack()\
-                                .dropna()\
-                                .reset_index(['sourcetype', 'source'],
-                                              name='share')
+                            [lambda x: x>cut_lower_share].unstack()\
+                            .dropna()\
+                            .reset_index(['sourcetype', 'source'],
+                                         name='share')
 
     ds = ds.reset_index(ds.index.names[1:], name='allocation')\
            .pipe(to_dask, use_dask)
@@ -349,16 +345,12 @@ def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
                              .swaplevel(axis=1))
 
     if as_categoricals:
-        share_per_bus_carrier = (share_per_bus_carrier
-                                 .pipe(to_categorical_index, axis=1)
-                                 .pipe(set_categories_for_level,
-                                       ['sink'], n.buses.index, axis=1))
+        share_per_bus_carrier = share_per_bus_carrier.pipe(set_cats, n, axis=1)
 
     share_per_bus_carrier = share_per_bus_carrier\
-                                [lambda x: x>cut_lower_share].unstack()\
-                                .dropna()\
-                                .reset_index(['sinktype', 'sink'],
-                                              name='share')
+                            [lambda x: x>cut_lower_share].unstack()\
+                            .dropna()\
+                            .reset_index(['sinktype', 'sink'], name='share')
 
     ds = ds.reset_index(ds.index.names[1:], name='allocation')\
            .pipe(to_dask, use_dask)
@@ -421,19 +413,21 @@ def _set_categories_for_level(df, level, categories, axis=0):
         inplace=False, axis=axis)
 
 
-def set_cats(df, n=None):
+def set_cats(df, n=None, axis=0):
     """
     Helper function for converting index of allocation series to categoricals.
     If a network is passed the categories will be aligned to the components
     of the network.
     """
     if n is None:
-        return df.pipe(_to_categorical_index)
+        return df.pipe(_to_categorical_index, axis=axis)
     buses = n.buses.index
     branch_names = n.branches().index.levels[1]
-    return df.pipe(_to_categorical_index)\
-             .pipe(_set_categories_for_level, ['sink', 'source'], buses)\
-             .pipe(_set_categories_for_level, ['branch_name'], branch_names)
+    bus_lv_names = ['sink', 'source', 'bus0', 'bus1', 'in', 'out']
+    return df.pipe(_to_categorical_index, axis=axis)\
+             .pipe(_set_categories_for_level, bus_lv_names, buses, axis=axis)\
+             .pipe(_set_categories_for_level, ['branch_name'],
+                   branch_names, axis=axis)
 
 
 def parmap(f, arg_list, nprocs=None, **kwargs):
@@ -530,8 +524,7 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
     f = (n.branches().assign(flow=f_in)
          .rename_axis(['component', 'branch_name'])
          .set_index(['bus0', 'bus1'], append=True)['flow']
-         .pipe(to_categorical_index)
-         .pipe(set_categories_for_level, ['bus0', 'bus1'], buses))
+         .pipe(set_cats, n))
 
     p = network_injection(n, snapshot, branch_components).T
     K = incidence_matrix(n, branch_components)
@@ -583,13 +576,11 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
 
     q = (Q.rename_axis('in').rename_axis('source', axis=1)
          .stack()[lambda ds: ds != 0].swaplevel(0)#.sort_index()
-         .rename('upstream').pipe(to_categorical_index)
-         .pipe(set_categories_for_level, ['source', 'in'], buses))
+         .rename('upstream').pipe(set_cats, n))
 
     r = (R.rename_axis('out').rename_axis('sink', axis=1)
          .stack()[lambda ds: ds != 0]#.sort_index()
-         .rename('downstream').pipe(to_categorical_index)
-         .pipe(set_categories_for_level, ['out', 'sink'], buses))
+         .rename('downstream').pipe(set_cats, n))
 
 
     if per_bus:
