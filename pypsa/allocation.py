@@ -362,6 +362,7 @@ def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
             .allocation.dropna()\
             .sort_index(level=0, sort_remaining=False)
 
+
 # %% Helper functions, not the right place in this module, but okay
 
 compute_if_dask = lambda df, b: df.compute() if b else df
@@ -605,12 +606,16 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
         f_sign = np.sign(f).set_axis(f.index.droplevel(['bus0', 'bus1']),
                                      inplace=0).rename('sign')
 
+        merge_kwargs = {'copy':False, 'sort':False}
+
         # for each source mulitply outgoing flow (at destiny) with local
         # ingoing line flow, for each sink ingoing flow at origin with local
         # outgoing line flow. All in respect to line direction
-        T = (f_dir.reset_index().merge(q.reset_index(), on='in')
-             .merge(r.reset_index(), on='out')
-             .merge(f_sign.reset_index(), on=['component', 'branch_name'])
+        T = (f_dir.reset_index()
+             .merge(q.reset_index(), on='in', **merge_kwargs)
+             .merge(r.reset_index(), on='out', **merge_kwargs)
+             .merge(f_sign.reset_index(), on=['component', 'branch_name'],
+                    **merge_kwargs)
              .set_index(['source', 'sink', 'component', 'branch_name'])
              .eval('upstream * flow *  downstream * sign'))
 
@@ -931,7 +936,7 @@ def marginal_welfare_contribution(n, snapshots=None, formulation='kirchhoff',
 
 
 def flow_allocation(n, snapshots=None, method='Average participation',
-                    to_hdf=False, key=None, parallelized=False, nprocs=None,
+                    key=None, parallelized=False, nprocs=None,
                     **kwargs):
     """
     Function to allocate the total network flow to buses. Available
@@ -1006,35 +1011,32 @@ def flow_allocation(n, snapshots=None, method='Average participation',
     if isinstance(snapshots, str):
         snapshots = [snapshots]
 
-    def month_start_info(sn):
-        if sn.is_month_start & (sn.hour == 0):
-            logger.info('Allocating for %s %s'%(sn.month_name(), sn.year))
-
-
-    if to_hdf:
-        assert isinstance(to_hdf, str), ('Argument to_csv must be of type'
-                         ' string, inidicating the path')
-        if key is None:
-            key = 'data'
-        store = pd.HDFStore(to_hdf)
-        if '/' + key in store.keys():
-            store.remove(key)
-        for sn in snapshots:
-            month_start_info(sn)
-            store.append(key, method_func(n, sn, **kwargs))
-        store.close()
-        return pd.read_hdf(to_hdf, key).pipe(set_cats, n)
-
+    if parallelized:
+        f = lambda sn: method_func(n, sn, **kwargs)
     else:
-        if parallelized:
-            f = lambda sn: method_func(n, sn, **kwargs)
-            flow = pd.concat(parmap(f, snapshots, nprocs=nprocs))
-        else:
-            month_start_info(snapshots[0])
-            flow = method_func(n, snapshots[0], **kwargs)
-            for sn in snapshots[1:]:
-                month_start_info(sn)
-                flow = flow.append(method_func(n, sn, **kwargs))
+        def f(sn):
+            if sn.is_month_start & (sn.hour == 0):
+                logger.info('Allocating for %s %s'%(sn.month_name(), sn.year))
+            return method_func(n, sn, **kwargs)
+
+#    if to_hdf:
+#        assert isinstance(to_hdf, str), ('Argument to_hdf must be of type'
+#                         ' string, inidicating the path')
+#        if key is None:
+#            key = 'data'
+#        store = pd.HDFStore(to_hdf)
+#        if '/' + key in store.keys():
+#            store.remove(key)
+#        for sn in snapshots:
+#            store.append(key, f(sn))
+#        store.close()
+#        return pd.read_hdf(to_hdf, key).pipe(set_cats, n)
+#
+#    else:
+    if parallelized:
+        flow = pd.concat(parmap(f, snapshots, nprocs=nprocs))
+    else:
+        flow = pd.concat((f(sn) for sn in snapshots))
     return flow.rename('allocation')
 
 
