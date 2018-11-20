@@ -14,7 +14,7 @@ import pandas as pd
 import numpy as np
 import scipy as sp
 import logging
-
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -936,7 +936,7 @@ def marginal_welfare_contribution(n, snapshots=None, formulation='kirchhoff',
 
 
 def flow_allocation(n, snapshots=None, method='Average participation',
-                    key=None, parallelized=False, nprocs=None,
+                    key=None, parallelized=False, nprocs=None, to_hdf=False,
                     **kwargs):
     """
     Function to allocate the total network flow to buses. Available
@@ -1011,7 +1011,7 @@ def flow_allocation(n, snapshots=None, method='Average participation',
     if isinstance(snapshots, str):
         snapshots = [snapshots]
 
-    if parallelized:
+    if parallelized and not to_hdf:
         f = lambda sn: method_func(n, sn, **kwargs)
     else:
         def f(sn):
@@ -1019,21 +1019,24 @@ def flow_allocation(n, snapshots=None, method='Average participation',
                 logger.info('Allocating for %s %s'%(sn.month_name(), sn.year))
             return method_func(n, sn, **kwargs)
 
-#    if to_hdf:
-#        assert isinstance(to_hdf, str), ('Argument to_hdf must be of type'
-#                         ' string, inidicating the path')
-#        if key is None:
-#            key = 'data'
-#        store = pd.HDFStore(to_hdf)
-#        if '/' + key in store.keys():
-#            store.remove(key)
-#        for sn in snapshots:
-#            store.append(key, f(sn))
-#        store.close()
-#        return pd.read_hdf(to_hdf, key).pipe(set_cats, n)
-#
-#    else:
-    if parallelized:
+
+    if to_hdf:
+        import random
+        hash = random.getrandbits(12)
+        store = '/tmp/temp{}.h5'.format(hash) if not isinstance(to_hdf, str) \
+                else to_hdf
+        periods = pd.period_range(snapshots[0], snapshots[-1], freq='m')
+        p_str = lambda p: '_t_' + str(p).replace('-', '')
+        for p in periods:
+            p_slicer = snapshots.slice_indexer(p.start_time, p.end_time)
+            gen = (f(sn) for sn in snapshots[p_slicer])
+            pd.concat(gen).to_hdf(store, p_str(p))
+
+        gen = (pd.read_hdf(store, p_str(p)).pipe(set_cats, n) for p in periods)
+        flow = pd.concat(gen)
+        os.remove(store)
+
+    elif parallelized:
         flow = pd.concat(parmap(f, snapshots, nprocs=nprocs))
     else:
         flow = pd.concat((f(sn) for sn in snapshots))
