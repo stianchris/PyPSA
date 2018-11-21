@@ -72,7 +72,7 @@ idx = pd.IndexSlice
 
 branch_defaults = pd.DataFrame({
     'Link': {'color': "teal", 'width': 1},
-    'Line': {'color': "orange", "width": 1},
+    'Line': {'color': "gold", "width": 1},
     'Transformer': {'color': 'forestgreen', 'width': 1}})
 
 
@@ -201,7 +201,7 @@ def plot(n, margin=0.05, ax=None, basemap=True, bus_colors='grey',
         bus_sizes = bus_sizes.sort_index(level=0, sort_remaining=False)
 
         patches = []
-        for b_i in bus_sizes.index.levels[0]:
+        for b_i in bus_sizes.index.unique(0):
             s = bus_sizes.loc[b_i]
             radius = s.sum()**0.5
             if radius == 0.0:
