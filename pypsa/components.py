@@ -445,7 +445,7 @@ class Network(Basic):
 
         #This guarantees that the correct attribute type is maintained
         obj_df = pd.DataFrame(data=[static_attrs.default],index=[name],columns=static_attrs.index)
-        new_df = cls_df.append(obj_df)
+        new_df = cls_df.append(obj_df, sort=False)
 
         setattr(self, self.components[class_name]["list_name"], new_df)
 
@@ -755,7 +755,7 @@ class Network(Basic):
 
     def controllable_branches(self):
         return pd.concat((self.df(c) for c in self.controllable_branch_components),
-                         keys=self.controllable_branch_components)
+                         keys=self.controllable_branch_components, sort=False)
 
     def determine_network_topology(self):
         """

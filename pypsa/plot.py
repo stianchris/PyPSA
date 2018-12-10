@@ -49,7 +49,7 @@ except:
 basemap_present = True
 try:
     from mpl_toolkits.basemap import Basemap
-except:
+except ImportError:
     basemap_present = False
 
 
@@ -64,7 +64,7 @@ except:
 pltly_present = True
 try:
         import plotly.offline as pltly
-except:
+except ImportError:
         pltly_present = False
 
 idx = pd.IndexSlice

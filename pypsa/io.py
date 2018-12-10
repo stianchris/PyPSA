@@ -140,7 +140,7 @@ class ExporterCSV(Exporter):
 
 class ImporterHDF5(Importer):
     def __init__(self, path):
-        self.ds = pd.HDFStore(path)
+        self.ds = pd.HDFStore(path, mode='r')
         self.index = {}
 
     def get_attributes(self):
@@ -299,13 +299,13 @@ def _export_to_exporter(network, exporter, basename, export_standard_types=False
 
     #exportable component types
     #what about None???? - nan is float?
-    allowed_types = [float,int,str,bool] + list(np.typeDict.values())
+    allowed_types = (float,int,bool) + string_types + tuple(np.typeDict.values())
 
     #first export network properties
     attrs = dict((attr, getattr(network, attr))
                  for attr in dir(network)
-                 if (attr[:2] != "__" and
-                     type(getattr(network,attr)) in allowed_types))
+                 if (not attr.startswith("__") and
+                     isinstance(getattr(network,attr), allowed_types)))
     exporter.save_attributes(attrs)
 
     #now export snapshots
@@ -666,7 +666,7 @@ def import_components_from_dataframe(network, dataframe, cls_name):
     old_df = network.df(cls_name)
     new_df = dataframe.drop(non_static_attrs_in_df, axis=1)
     if not old_df.empty:
-        new_df = pd.concat((old_df, new_df))
+        new_df = pd.concat((old_df, new_df), sort=False)
 
     if not new_df.index.is_unique:
         logger.error("Error, new components for {} are not unique".format(cls_name))
@@ -712,13 +712,13 @@ def import_series_from_dataframe(network, dataframe, cls_name, attr):
     if len(diff) > 0:
         logger.warning("Components {} for attribute {} of {} are not in main components dataframe {}".format(diff,attr,cls_name,list_name))
 
-    diff = network.snapshots.difference(dataframe.index)
-    if len(diff):
-        logger.warning("Snapshots {} are missing from {} of {}".format(diff,attr,cls_name))
-
-
     attr_series = network.components[cls_name]["attrs"].loc[attr]
     columns = dataframe.columns
+
+    diff = network.snapshots.difference(dataframe.index)
+    if len(diff):
+        logger.warning("Snapshots {} are missing from {} of {}. Filling with default value '{}'".format(diff,attr,cls_name,attr_series["default"]))
+        dataframe = dataframe.reindex(network.snapshots, fill_value=attr_series["default"])
 
     if not attr_series.static:
         pnl[attr] = pnl[attr].reindex(columns=df.index|columns, fill_value=attr_series.default)
@@ -929,13 +929,13 @@ def import_from_pandapower_net(network, net):
                                                              "q_set" : -(net.sgen.scaling*net.sgen.q_kvar).values/1e3,
                                                              "bus" : net.bus.name.loc[net.sgen.bus].values,
                                                              "control" : "PQ"},
-                                                            index=net.sgen.name)))
+                                                            index=net.sgen.name)), sort=False)
 
     d["Generator"] = pd.concat((d["Generator"],pd.DataFrame({"control" : "Slack",
                                                              "p_set" : 0.,
                                                              "q_set" : 0.,
                                                              "bus" : net.bus.name.loc[net.ext_grid.bus].values},
-                                                            index=net.ext_grid.name.fillna("External Grid"))))
+                                                            index=net.ext_grid.name.fillna("External Grid"))), sort=False)
 
     d["Bus"].loc[net.bus.name.loc[net.ext_grid.bus].values,"v_mag_pu_set"] = net.ext_grid.vm_pu.values
 
