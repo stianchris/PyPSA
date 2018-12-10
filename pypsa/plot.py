@@ -195,8 +195,12 @@ def plot(n, margin=0.05, ax=None, basemap=True, bus_colors='grey',
                                    missing_colors.to_dict()))
         if legend:
             handles = marker_from_color_series(bus_colors)
-            ax.legend(handles=handles, labels=bus_colors.index.tolist(),
-                      loc=2, frameon=True, framealpha=0.2)
+            labels = bus_colors.index.tolist()
+            ax.add_artist(
+                ax.legend(handles=handles, edgecolor='w',
+                          facecolor='inherit', fancybox=True,
+                          labels=labels,
+                          loc=2, framealpha=1))
 
         bus_sizes = bus_sizes.sort_index(level=0, sort_remaining=False)
 
@@ -296,7 +300,7 @@ def plot(n, margin=0.05, ax=None, basemap=True, bus_colors='grey',
 
         branch_collections.append(l_collection)
 
-    bus_collection.set_zorder(2)
+    bus_collection.set_zorder(3)
 
     ax.update_datalim(compute_bbox_with_margins(margin, x, y))
     ax.autoscale_view()
@@ -308,6 +312,7 @@ def plot(n, margin=0.05, ax=None, basemap=True, bus_colors='grey',
     ax.set_title(title)
 
     return (bus_collection,) + tuple(branch_collections)
+
 
 
 def marker_from_color_series(ds):

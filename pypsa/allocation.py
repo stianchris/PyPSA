@@ -830,7 +830,7 @@ def zbus_transmission(n, snapshot):
                  .unstack().reindex(index=buses, columns=buses)).fillna(0)
     Y = Y_diag - Y_offdiag - Y_offdiag.T
 
-    Z = pd.DataFrame(pinv(Y), buses, buses)
+    Z = pinv(Y)
     # set angle of slackbus to 0
     Z = Z.add(-Z.loc[slackbus])
     # DC-approximated S = P
@@ -853,12 +853,15 @@ def zbus_transmission(n, snapshot):
               .set_index(n.lines.bus1, append=True))
     y_se = (1/(n.lines["r_pu"] + 1.j*n.lines["x_pu"])
             .set_axis(Z_diff.index, inplace=False))
-    y_sh = ((n.lines["g_pu"] + 1.j*n.lines["b_pu"])
-            .set_axis(Z_diff.index, inplace=False))
+
+#    y_sh = ((n.lines["g_pu"] + 1.j*n.lines["b_pu"])
+#            .set_axis(Z_diff.index, inplace=False))
 
     # build electrical distance according to equation (7)
     A = (Z_diff.mul(y_se, axis=0)
          + Z.reindex(Z_diff.index.levels[0]).mul(y_sh, axis=0))
+
+
 
 
 def marginal_welfare_contribution(n, snapshots=None, formulation='kirchhoff',

@@ -1206,7 +1206,9 @@ def extract_optimisation_results(network, snapshots, formulation="angles", free_
             pd.concat({c.name:
                        c.pnl.p.loc[snapshots].multiply(c.df.sign, axis=1)
                        .groupby(c.df.bus, axis=1).sum()
-                       for c in network.iterate_components(network.controllable_one_port_components)}) \
+                       for c in network.iterate_components\
+                               (network.controllable_one_port_components)},
+                sort=True) \
               .sum(level=1) \
               .reindex(columns=network.buses_t.p.columns, fill_value=0.)
 
