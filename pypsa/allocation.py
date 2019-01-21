@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Created on Wed Feb 21 12:14:49 2018
@@ -13,6 +13,7 @@ from pandas import IndexSlice as idx
 import pandas as pd
 import numpy as np
 import scipy as sp
+from collections import Iterable
 import logging
 import os
 
@@ -30,15 +31,31 @@ def inv(df):
 
 
 def null(df):
+    if df.empty:
+        return df
     return pd.DataFrame(sp.linalg.null_space(df), index=df.columns)
 
 
-def cycles(n):
-    if not 'C' in n.__dir__():
-        find_cycles(n, weight=None, dense=True)
-        return n.C
+def cycles(n, dense=True, update=True):
+    if (not 'C' in n.__dir__()) | update:
+        find_cycles(n, dense=dense)
+        return n.C.T
     else:
-        return n.C
+        return n.C.T
+
+def active_cycles(n, snapshot):
+    f = pd.concat([n.lines_t.p0.loc[snapshot], n.links_t.p0.loc[snapshot]],
+              keys=['Line', 'Link'])
+
+    # copy original links
+    orig_links = n.links.copy()
+    # modify current links
+    n.links = n.links[f.Link.abs() >= 1e-8]
+    C = cycles(n, update=True)
+    # reassign original links
+    n.links = orig_links
+    return C.reindex(columns=n.branches().index, fill_value=0)
+
 
 
 def mixed_cycle_flows(n, snapshot=None):
@@ -46,10 +63,8 @@ def mixed_cycle_flows(n, snapshot=None):
         snapshot = n.snapshots[0]
     f = pd.concat([n.lines_t.p0.loc[snapshot], n.links_t.p0.loc[snapshot]],
                   keys=['Line', 'Link'])
-    cycle_flow = (cycles(n).mul(f, axis=0)
-                  .div(susceptance(n, ['Line', 'Link'], snapshot), axis=0)
-                  .fillna(0))
-    return cycle_flow
+    omega = susceptance(n, ['Line', 'Link'], snapshot)
+    return (cycles(n, update=True).T * f / omega).T.fillna(0)
 
 
 def diag(df):
@@ -84,53 +99,51 @@ def incidence_matrix(n, branch_components=['Link', 'Line']):
                      - (n.df(c).assign(K=1).set_index('bus1', append=True)['K']
                      .unstack().reindex(columns=buses).fillna(0).T)
                      for c in branch_components],
-                     keys=branch_components, axis=1, sort=False)
+                     keys=branch_components, axis=1, sort=False)\
+            .reindex(columns=n.branches().loc[branch_components].index)
 
 
-def susceptance(n, branch_components=['Line'], snapshot=None):
+def impedance(n, branch_components=['Line', 'Link'], snapshot=None):
     n.lines = n.lines.assign(carrier=n.lines.bus0.map(n.buses.carrier))
-    assert (n.lines.carrier == n.lines.bus1.map(n.buses.carrier)).all()
-    sus = (pd.concat([(1/(n.lines.x_pu.where(n.lines.carrier == 'AC', 0) +
-                          n.lines.r_pu.where(n.lines.carrier == 'DC', 0)))],
-           keys=['Line']))
 
-    if 'Link' in branch_components:
-        if snapshot is None:
-            logger.warn('Link in argument "branch_components", but no '
+    #impedance
+    _z = [n.lines.x_pu_eff.where(n.lines.carrier == 'AC', n.lines.r_pu_eff)]
+    z = pd.concat(_z, keys=["Line"])
+
+    if branch_components == ['Line']:
+        return z.loc['Line']
+    if snapshot is None:
+        logger.warn('Link in argument "branch_components", but no '
                         'snapshot given. Falling back to first snapshot')
-            snapshot = n.snapshots[0]
-        elif isinstance(snapshot, pd.DatetimeIndex):
-            snapshot = snapshot[0]
-        # get cycle with links included
-        link_cycles = cycles(n).loc[:, lambda df: ~(df.loc['Link'] == 0).all()]
-        f = pd.concat([n.lines_t.p0.loc[snapshot], n.links_t.p0.loc[snapshot]],
-                      keys=['Line', 'Link'])
-        # effective cycles:
-        link_cycles = (link_cycles
-                       .loc[:, ~(link_cycles != 0)[(f.round(8) == 0)].any()])
-        sus_line = sus.reindex(link_cycles.index, fill_value=1)
-        cycle_line_sus_flow_sum = (link_cycles.loc[['Line']]
-                                   .mul(f.loc[['Line']], axis=0)
-                                   .div(sus_line.loc[['Line']], axis=0).sum())
+        snapshot = n.snapshots[0]
+    elif isinstance(snapshot, pd.DatetimeIndex):
+        snapshot = snapshot[0]
 
-        # fill not-in-cycles links with current flow
-        cycle_link_flow = link_cycles.mul(f, axis=0).loc[['Link']]
-        if link_cycles.empty:
-            p = pd.Series(0., cycle_link_flow.index)
-        elif (cycle_line_sus_flow_sum == 0).all():
-            p = sp.linalg.null_space(cycle_link_flow.T)[:,0]
-        else:
-            p, res, rnk, s = \
-                sp.linalg.lstsq(cycle_link_flow.T, -cycle_line_sus_flow_sum)
-#        import pdb; pdb.set_trace()
-        sus_link = (pd.DataFrame(p, index=cycle_link_flow.index)[0]
-                    .pow(-1)
-                    .replace(np.inf, 0)
-                    # add current link flows for not-in-cycle-links
-                    .where(lambda df: df != 0, f.loc[['Link']])
-                    .reindex(link_cycles.index, fill_value=1))
-        sus = sus_line * sus_link
-    return sus.loc[idx[branch_components, :]]
+    f = pd.concat([n.lines_t.p0.loc[snapshot], n.links_t.p0.loc[snapshot]],
+                  keys=['Line', 'Link'])
+    n.lines = n.lines.assign(carrier=n.lines.bus0.map(n.buses.carrier))
+
+    C = active_cycles(n, snapshot)
+
+    C_mix = C[((( C != 0) & (f != 0)).groupby(level=0, axis=1).any()).Link]
+
+    if C_mix.empty:
+        omega = f[['Link']]
+    elif z.empty:
+        logger.info("z is empty")
+        omega = null(C_mix[['Link']] @ diag(f[['Link']]))[0]
+    else:
+        omega = - pinv(C_mix[['Link']] @ diag(f[['Link']])) \
+                @ C_mix[['Line']] @ diag(z) @ f[['Line']]
+
+    omega = omega.round(10) #numerical issues either
+    omega[(omega == 0) & (f[['Link']] != 0)] = 1/f
+    return pd.concat([z, omega]).loc[branch_components]
+
+
+def susceptance(n, branch_components=['Line', 'Link'], snapshot=None):
+    return (1/impedance(n, branch_components, snapshot))\
+            .replace([np.inf, -np.inf], 0)
 
 
 def PTDF(n, branch_components=['Line'], snapshot=None):
@@ -150,7 +163,7 @@ def network_injection(n, snapshots=None, branch_components=['Link', 'Line']):
     if isinstance(snapshots, pd.Timestamp):
         snapshots = [snapshots]
     if branch_components == ['Line']:
-        return n.buses_t.p.loc[snapshots].T
+        return n.buses_t.p.loc[snapshots]
     elif sorted(branch_components) == ['Line', 'Link']:
         if 'p_n' not in n.buses_t.keys():
             n.buses_t['p_n'] = (sum(n.pnl(l)['p{}'.format(i)]
@@ -430,6 +443,12 @@ def set_cats(df, n=None, axis=0):
              .pipe(_set_categories_for_level, ['branch_name'],
                    branch_names, axis=axis)
 
+def droplevel(df, levels, axis=0):
+    ax = df.axes[axis]
+    for level in levels:
+        ax = ax.droplevel(level)
+    return df.set_axis(ax, axis=axis, inplace=False)
+
 
 def parmap(f, arg_list, nprocs=None, **kwargs):
     import multiprocessing
@@ -522,7 +541,8 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
                 keys=branch_components, sort=True))
     f_out = (pd.concat([-n.pnl(c).p1.loc[snapshot] for c in branch_components],
                 keys=branch_components, sort=True))
-    f = (n.branches().assign(flow=f_in)
+    f = (n.branches().loc[branch_components]
+         .assign(flow=f_in)
          .rename_axis(['component', 'branch_name'])
          .set_index(['bus0', 'bus1'], append=True)['flow']
          .pipe(set_cats, n))
@@ -530,12 +550,12 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
     p = network_injection(n, snapshot, branch_components).T
     K = incidence_matrix(n, branch_components)
 #    set incidence matrix in direction of flow
-    K = K.mul(np.sign(f_in))
+    K_dir = K.mul(np.sign(f_in))
     f_in = f_in.abs().to_frame()
     f_out = f_out.abs().to_frame()
 
-    n_in = K.clip_upper(0).dot(f_in).abs()  # network inflow
-    n_out = K.clip_lower(0).dot(f_out).abs()  # network outflow
+    n_in = K_dir.clip_upper(0).dot(f_in).abs()  # network inflow
+    n_out = K_dir.clip_lower(0).dot(f_out).abs()  # network outflow
     if aggregated:
         p_in = p.clip_lower(0)  # nodal inflow
         p_out = p.clip_upper(0).abs()  # nodal outflow
@@ -550,7 +570,7 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
 #   F_in == F_out == (p_out + n_out)[snapshot]
 
     # flows from bus (column) to bus (index):
-    F = (K.dot(diag(f_in)).clip_lower(0).dot(K.T).clip_upper(0).abs()
+    F = (K_dir.dot(diag(f_in)).clip_lower(0).dot(K_dir.T).clip_upper(0).abs()
          .rename_axis('in').rename_axis('out', axis=1)).T
 
     # downstream
@@ -622,7 +642,7 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
     return pd.concat([T], keys=[snapshot], names=['snapshot'])
 
 
-def marginal_participation(n, snapshot, q=0.5, normalized=False,
+def marginal_participation(n, snapshot=None, q=0.5, normalized=False,
                            per_bus=False):
     '''
     Allocate line flows according to linear sensitvities of nodal power
@@ -663,29 +683,36 @@ def marginal_participation(n, snapshot, q=0.5, normalized=False,
         Return the share of the source (sink) flow
 
     '''
+    snapshot = n.snapshots[0] if snapshot is None else snapshot
     H = PTDF(n)
     p = n.buses_t.p.loc[snapshot]
     p_plus = p.clip_lower(0)
+    p_minus = p.clip_upper(0)
     f = n.lines_t.p0.loc[snapshot]
 #   unbalanced flow from positive injection:
-    f_plus = H.dot(p_plus)
-    k_plus = (q*f - f_plus)/p_plus.sum()
+    f_plus = H @ p_plus
+    f_minus = H @ p_minus
+    k_plus = (q * f - f_plus) / p_plus.sum()
     if normalized:
         Q = H.add(k_plus, axis=0).mul(p, axis=1).div(f, axis=0).round(10).T
     else:
         Q = H.add(k_plus, axis=0).mul(p, axis=1).round(10).T
     if per_bus:
-        K = incidence_matrix(n)
-        Q = K.dot(Q.T)
-        Q = (Q.rename_axis('bus').rename_axis('bus', axis=1)
+        K = incidence_matrix(n, branch_components=['Line'])
+        Q = K @ Q.T
+        Q = (Q.rename_axis('source').rename_axis('sink', axis=1)
              .stack().round(8)[lambda ds:ds != 0])
     else:
-        Q = (Q.rename_axis('bus').rename_axis("line", axis=1)
-             .stack().round(8)[lambda ds:ds != 0])
+        Q = (Q.rename_axis('bus')
+             .rename_axis(['component', 'branch_name'], axis=1)
+             .unstack()
+             .round(8)[lambda ds:ds != 0]
+             .reorder_levels(['bus', 'component', 'branch_name'])
+             .sort_index())
     return pd.concat([Q], keys=[snapshot], names=['snapshot'])
 
 
-def virtual_injection_pattern(n, snapshot, normalized=False, per_bus=False,
+def virtual_injection_pattern(n, snapshot=None, normalized=False, per_bus=False,
                               downstream=True):
     """
     Sequentially calculate the load flow induced by individual
@@ -709,7 +736,7 @@ def virtual_injection_pattern(n, snapshot, normalized=False, per_bus=False,
         Return the share of the source (sink) flow
 
     """
-
+    snapshot = n.snapshots[0] if snapshot is None else snapshot
     H = PTDF(n)
     p = n.buses_t.p.loc[snapshot]
     p_plus = p.clip_lower(0)
@@ -719,12 +746,10 @@ def virtual_injection_pattern(n, snapshot, normalized=False, per_bus=False,
         indiag = diag(p_plus)
         offdiag = (p_minus.to_frame().dot(p_plus.to_frame().T)
                    .div(p_plus.sum()))
-#                   .pipe(lambda df: df - np.diagflat(np.diag(df)))
     else:
         indiag = diag(p_minus)
         offdiag = (p_plus.to_frame().dot(p_minus.to_frame().T)
                    .div(p_minus.sum()))
-#                   .pipe(lambda df: df - np.diagflat(np.diag(df))))
     vip = indiag + offdiag
     if per_bus:
         Q = (vip[indiag.sum() == 0].T
@@ -737,8 +762,12 @@ def virtual_injection_pattern(n, snapshot, normalized=False, per_bus=False,
         if normalized:
             # normalized colorvectors
             Q /= f
-        Q = (Q.rename_axis('bus').rename_axis("line", axis=1)
-             .stack().round(8)[lambda ds: ds != 0])
+        Q = (Q.rename_axis('bus') \
+              .rename_axis(["component", 'branch_name'], axis=1)
+              .unstack().round(8)
+              .reorder_levels(['bus', 'component', 'branch_name'])
+              .sort_index()
+              [lambda ds: ds != 0])
     return pd.concat([Q], keys=[snapshot], names=['snapshot'])
 
 
@@ -804,7 +833,7 @@ def optimal_flow_shares(n, snapshot, method='min', downstream=True,
         return H.dot(sol).round(8)
 
 
-def zbus_transmission(n, snapshot):
+def zbus_transmission(n, snapshot=None):
     '''
     This allocation builds up on the method presented in [1]. However, we
     provide for non-linear power flow an additional DC-approximated
@@ -817,30 +846,28 @@ def zbus_transmission(n, snapshot):
 
     '''
     n.calculate_dependent_values()
-    buses = n.buses.index
-    slackbus = n.sub_networks.obj[0].slack_bus
+    snapshot = n.snapshots[0] if snapshot is None else snapshot
+    slackbus = n.buses[(n.buses_t.v_ang == 0).all()].index[0]
 
 
     # linearised method, start from linearised admittance matrix
-    Y_diag = diag((1/n.lines.x).groupby(n.lines.bus0).sum()
-                  .reindex(n.buses.index, fill_value=0)) \
-             + diag((1/n.lines.x).groupby(n.lines.bus1).sum()
-                    .reindex(n.buses.index, fill_value=0))
-    Y_offdiag = (1/n.lines.set_index(['bus0', 'bus1']).x
-                 .unstack().reindex(index=buses, columns=buses)).fillna(0)
-    Y = Y_diag - Y_offdiag - Y_offdiag.T
+    Omega =  -1.j * susceptance(n) #+ 1/n.branches().loc[['Line']].r_pu_eff
+    K = incidence_matrix(n, branch_components=['Line'])
+
+    Y = K @ diag(Omega) @ K.T  # weighted Laplacian Y = B
 
     Z = pinv(Y)
     # set angle of slackbus to 0
     Z = Z.add(-Z.loc[slackbus])
     # DC-approximated S = P
-    S = n.buses_t.p.loc[[snapshot]].T
-    V = n.buses.v_nom.to_frame(snapshot) * n.buses_t.v_ang.T
-    I = Y.dot(V)
+    # S = n.buses_t.p.loc[[snapshot]].T
+    V = n.buses.v_nom.to_frame(snapshot) * \
+        (1 + 1.j * n.buses_t.v_ang.loc[[snapshot]].T).rename_axis('bus0')
+    I = Y @ V
 
     # -------------------------------------------------------------------------
     # nonlinear method start with full admittance matrix from pypsa
-    n.sub_networks.obj[0].calculate_Y()
+#    n.sub_networks.obj[0].calculate_Y()
     # Zbus matrix
 #    Y = pd.DataFrame(n.sub_networks.obj[0].Y.todense(), buses, buses)
 #    Z = pd.DataFrame(pinv(Y), buses, buses)
@@ -848,19 +875,31 @@ def zbus_transmission(n, snapshot):
 
     # -------------------------------------------------------------------------
 
-    # difference in the first term
-    Z_diff = ((Z.reindex(n.lines.bus0) - Z.reindex(n.lines.bus1).values)
-              .set_index(n.lines.bus1, append=True))
-    y_se = (1/(n.lines["r_pu"] + 1.j*n.lines["x_pu"])
-            .set_axis(Z_diff.index, inplace=False))
+    # y_sh = n.lines.set_index(['bus0', 'bus1']).eval('g_pu + 1.j * b_pu')
 
-#    y_sh = ((n.lines["g_pu"] + 1.j*n.lines["b_pu"])
-#            .set_axis(Z_diff.index, inplace=False))
+    # Z is the inverse of the weighted laplacian
+    A = (K * Omega).T @ Z
+         #+ Z.mul(y_sh, axis=0, level=0).set_axis(n.lines.index, inplace=False)
+    A = A.applymap(np.real_if_close)
+    branches = ['Line']
+    f = pd.concat([n.pnl(b).p0.loc[snapshot] for b in branches], keys=branches)
 
-    # build electrical distance according to equation (7)
-    A = (Z_diff.mul(y_se, axis=0)
-         + Z.reindex(Z_diff.index.levels[0]).mul(y_sh, axis=0))
+    V_l_at = lambda bus: pd.concat(
+                [n.df(b)[bus].map(V[snapshot])
+                 / n.df(b)[bus].map(n.buses.v_nom ** 2)
+                      for b in branches], keys=branches)
 
+    V_l = V_l_at('bus0').where(f > 0, V_l_at('bus1'))
+
+    q = A.mul(V_l, axis=0)\
+         .mul(I[snapshot]) \
+         .applymap(np.real) \
+         .stack() \
+         .rename_axis(['component', 'branch_name', 'bus']) \
+         .reorder_levels(['bus', 'component', 'branch_name'])\
+         .sort_index()
+
+    return pd.concat([q], keys=[snapshot], names=['snapshot'])
 
 
 
@@ -989,6 +1028,8 @@ def flow_allocation(n, snapshots=None, method='Average participation',
         from the flow allocation.
     """
 #    raise error if there are no flows
+
+    snapshots = snapshots if isinstance(snapshots, Iterable) else [snapshots]
     if n.lines_t.p0.shape[0] == 0:
         raise ValueError('Flows are not given by the network, '
                          'please solve the network flows first')
