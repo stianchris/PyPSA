@@ -70,16 +70,20 @@ except ImportError:
 idx = pd.IndexSlice
 
 
-branch_defaults = pd.DataFrame({
+#defaults for branches
+defs = pd.DataFrame({
     'Link': {'color': "teal", 'width': 1},
     'Line': {'color': "gold", "width": 1},
     'Transformer': {'color': 'forestgreen', 'width': 1}})
 
 
-def plot(n, margin=0.05, ax=None, basemap=True, bus_colors='grey',
-         line_colors=None, bus_sizes=10, flow=None, generation=None,
-         line_widths=1, title="", line_cmap=None, bus_cmap=None,
-         boundaries=None, geometry=False, legend=True,
+def plot(n, margin=0.05, ax=None,
+         basemap=True, boundaries=None,
+         bus_sizes=10, bus_colors='grey', bus_cmap=None,
+         line_widths=1, line_colors='gold', line_cmap=None,
+         link_widths=1, link_colors='teal', link_cmap=None,
+         flow=None, generation=None,
+         title="", legend=True, geometry=False,
          branch_components=['Line', 'Link'], jitter=None):
     """
     Plot the network buses and lines using matplotlib and Basemap.
@@ -162,17 +166,7 @@ def plot(n, margin=0.05, ax=None, basemap=True, bus_colors='grey',
         x, y = n.buses['x'], n.buses['y']
 
     # 2. set bus_sizes from generation argument
-    if isinstance(generation, str) or callable(generation):
-        bus_sizes = (n.generators
-                     .assign(sizes = n.generators_t.p.agg(generation))
-                     .groupby(['bus' , 'carrier'])['sizes'].sum()
-                     [lambda ds: ds>0] * bus_sizes / 1e3)
-    elif generation in n.snapshots:
-        bus_sizes = (n.generators
-                     .assign(sizes = n.generators_t.p.loc[generation])
-                     .groupby(['bus' , 'carrier'])['sizes'].sum()
-                     [lambda ds: ds>0] * bus_sizes / 1e3)
-
+    bus_sizes = bus_sizes * get_generation_data_from_arg(generation, n)
     # 3. plot bus_sizes
     if isinstance(bus_sizes, pd.Series) and isinstance(bus_sizes.index,
                  pd.MultiIndex):
@@ -229,38 +223,36 @@ def plot(n, margin=0.05, ax=None, basemap=True, bus_colors='grey',
 
     # 4. plot flow arrows if flow argument is present
     branch_collections = []
-#    l_default = (None if pd.api.types.is_numeric_dtype(line_colors)
-#                 else branch_defaults.loc['color'])
-    line_colors = as_series(line_colors, n, branch_components,
-                            branch_defaults.loc['color'])
+    lines_i = n.lines.index
+    links_i = n.links.index
 
-    line_widths = as_series(line_widths, n, branch_components,
-                            branch_defaults.loc['width'])
-    if flow in n.snapshots:
-        flow = (pd.concat([n.pnl(c).p0.loc[flow]
-                for c in branch_components],
-                keys=branch_components, sort=True))
-    elif isinstance(flow, str) or callable(flow):
-        flow = (pd.concat([n.pnl(c).p0 for c in branch_components],
-                axis=1, keys=branch_components, sort=True)
-                .agg(flow, axis=0))
+    branch_widths = pd.concat(
+        [pd.Series(line_widths, lines_i).fillna(defs.loc['width', 'Line']),
+         pd.Series(link_widths, links_i).fillna(defs.loc['width', 'Link'])],
+         keys=['Line', 'Link'])
+
+    branch_colors = pd.concat(
+        [pd.Series(line_colors, lines_i).fillna(defs.loc['color', 'Line']),
+         pd.Series(link_colors, links_i).fillna(defs.loc['color', 'Link'])],
+         keys=['Line', 'Link'])
+
     if flow is not None:
+        arrow_scale = (len(n.branches()) + 100) / branch_widths
+        flow = get_flow_data_from_arg(flow, n, branch_components)/arrow_scale
         # set a rough estimate of flow_scale
-        flow_scale = (len(n.lines)+100) / line_widths
-        arrows = directed_flow(n, flow, ax=ax, flow_scale=flow_scale,
-                               line_colors=line_colors)
+        arrows = directed_flow(n, flow, ax=ax, branch_colors=branch_colors)
         branch_collections.append(arrows)
-        line_widths = (as_series(flow, n, branch_components,
-                       branch_defaults.loc['width']) / flow_scale)
+        #fix the ratio of arrow width and line width
+        branch_widths = flow.abs().pipe(np.sqrt).clip(lower=branch_widths)*10
 
     if not isinstance(line_cmap, dict):
         line_cmap = {'Line': line_cmap}
 
     # 5. plot lines
     for c in n.iterate_components(branch_components):
-        l_widths = line_widths.loc[c.name]
+        l_widths = branch_widths.loc[c.name]
         l_nums = None
-        l_colors = line_colors.loc[c.name]
+        l_colors = branch_colors.loc[c.name]
 
         if pd.api.types.is_numeric_dtype(l_colors):
             l_nums = l_colors
@@ -320,21 +312,25 @@ def marker_from_color_series(ds):
             Line2D([], [], c=x, marker='.', linestyle='None', markersize=20))
             .tolist())
 
+def as_series(value, index, default):
+    return pd.Series(value, index).fillna(default)
 
-def as_series(ser, n, components, default=np.nan):
-    index = n.branches().loc[idx[components, :], :].index
-    if not isinstance(ser, (pd.Series, dict)):
-        ser = pd.Series(ser, index=index)
-    elif isinstance(ser, pd.Series) & isinstance(ser.index, pd.MultiIndex):
-        ser = ser.reindex(index)
-    else:
-        ser = (pd.concat([pd.Series(ser).reindex(index, level=0).dropna(),
-                         pd.Series(ser).reindex(index, level=1).dropna()],
-                         sort=False)[lambda ds: ~ds.index.duplicated()]
-               .reindex(index))
-    if isinstance(default, (dict, pd.Series)):
-        default = pd.Series(default).reindex(index, level=0)
-    return ser.where(ser.notnull(), default)
+
+
+#def as_series(ser, n, components, default=np.nan):
+#    index = n.branches().loc[idx[components, :], :].index
+#    if not isinstance(ser, (pd.Series, dict)):
+#        ser = pd.Series(ser, index=index)
+#    elif isinstance(ser, pd.Series) & isinstance(ser.index, pd.MultiIndex):
+#        ser = ser.reindex(index)
+#    else:
+#        ser = (pd.concat([pd.Series(ser).reindex(index, level=0).dropna(),
+#                         pd.Series(ser).reindex(index, level=1).dropna()],
+#                         sort=False)[lambda ds: ~ds.index.duplicated()]
+#               .reindex(index))
+#    if isinstance(default, (dict, pd.Series)):
+#        default = pd.Series(default).reindex(index, level=0)
+#    return ser.where(ser.notnull(), default)
 
 
 def compute_bbox_with_margins(margin, x, y):
@@ -385,19 +381,44 @@ def draw_map(network=None, jitter=None, ax=None, boundaries=None,
     return x, y
 
 
-def directed_flow(n, flow, flow_scale=None, ax=None, line_colors='darkgreen',
-                  branch_comps=['Line', 'Link']):
+def get_flow_data_from_arg(flow, n, branch_components):
+    if isinstance(flow, pd.Series):
+        return flow
+    if flow in n.snapshots:
+        return (pd.concat([n.pnl(c).p0.loc[flow]
+                for c in branch_components],
+                keys=branch_components, sort=True))
+    elif isinstance(flow, str) or callable(flow):
+        return (pd.concat([n.pnl(c).p0 for c in branch_components],
+                axis=1, keys=branch_components, sort=True)
+                .agg(flow, axis=0))
+
+def get_generation_data_from_arg(generation, n):
+    if generation is None:
+        return 1
+    if isinstance(generation, pd.Series):
+        return generation
+    if generation in n.snapshots:
+        return (n.generators
+                     .assign(sizes = n.generators_t.p.loc[generation])
+                     .groupby(['bus' , 'carrier'])['sizes'].sum()
+                     [lambda ds: ds>0]  / 1e3)
+    if isinstance(generation, str) or callable(generation):
+        return (n.generators
+                     .assign(sizes = n.generators_t.p.agg(generation))
+                     .groupby(['bus' , 'carrier'])['sizes'].sum()
+                     [lambda ds: ds>0] / 1e3)
+
+
+def directed_flow(n, flow, ax=None,
+                  branch_colors='darkgreen', branch_comps=['Line', 'Link']):
     """
     Helper function to generate arrows from flow data.
     """
 #    this funtion is used for diplaying arrows representing the network flow
     from matplotlib.patches import FancyArrow
-    if flow_scale is None:
-        flow_scale = 1
     if ax is None:
         ax = plt.gca()
-    # align index level names
-    flow_scale.index.names = flow.index.names
 #    set the scale of the arrowsizes
     fdata = pd.concat([pd.DataFrame(
                       {'x1': n.df(l).bus0.map(n.buses.x),
@@ -405,8 +426,7 @@ def directed_flow(n, flow, flow_scale=None, ax=None, line_colors='darkgreen',
                        'x2': n.df(l).bus1.map(n.buses.x),
                        'y2': n.df(l).bus1.map(n.buses.y)})
                       for l in branch_comps], keys=branch_comps)
-    fdata['arrowsize'] = (flow.abs()
-                          .pipe(lambda ds: np.sqrt(ds / flow_scale))
+    fdata['arrowsize'] = (flow.abs().pipe(np.sqrt)
                           .clip(lower=1e-8) / 2.)
     fdata['direction'] = np.sign(flow)
     fdata['linelength'] = (np.sqrt((fdata.x1 - fdata.x2)**2. +
@@ -434,7 +454,7 @@ def directed_flow(n, flow, flow_scale=None, ax=None, line_colors='darkgreen',
                            0.001*(ds.x2 - ds.x1),
                            0.001*(ds.y2 - ds.y1),
                            head_width=ds.arrowsize), axis=1))
-    fdata = fdata.assign(color=line_colors)
+    fdata = fdata.assign(color=branch_colors)
     arrowcol = PatchCollection(fdata[fdata.arrows.notnull()].arrows,
                                color=fdata.color,
                                edgecolors='k',

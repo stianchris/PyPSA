@@ -16,12 +16,12 @@ import scipy as sp
 from collections import Iterable
 import logging
 import os
+from numpy import sign
 
 logger = logging.getLogger(__name__)
 
 
-# %% utility functions
-
+# %% linalg
 
 def pinv(df):
     return pd.DataFrame(np.linalg.pinv(df), df.columns, df.index)
@@ -34,37 +34,6 @@ def null(df):
     if df.empty:
         return df
     return pd.DataFrame(sp.linalg.null_space(df), index=df.columns)
-
-
-def cycles(n, dense=True, update=True):
-    if (not 'C' in n.__dir__()) | update:
-        find_cycles(n, dense=dense)
-        return n.C.T
-    else:
-        return n.C.T
-
-def active_cycles(n, snapshot):
-    f = pd.concat([n.lines_t.p0.loc[snapshot], n.links_t.p0.loc[snapshot]],
-              keys=['Line', 'Link'])
-
-    # copy original links
-    orig_links = n.links.copy()
-    # modify current links
-    n.links = n.links[f.Link.abs() >= 1e-8]
-    C = cycles(n, update=True)
-    # reassign original links
-    n.links = orig_links
-    return C.reindex(columns=n.branches().index, fill_value=0)
-
-
-
-def mixed_cycle_flows(n, snapshot=None):
-    if snapshot is None:
-        snapshot = n.snapshots[0]
-    f = pd.concat([n.lines_t.p0.loc[snapshot], n.links_t.p0.loc[snapshot]],
-                  keys=['Line', 'Link'])
-    omega = susceptance(n, ['Line', 'Link'], snapshot)
-    return (cycles(n, update=True).T * f / omega).T.fillna(0)
 
 
 def diag(df):
@@ -90,7 +59,7 @@ def eig(M):
     vec = pd.DataFrame(vec, index=M.index).reindex(columns=val.index)
     return val, vec
 
-
+#%% graph and power flow
 
 def incidence_matrix(n, branch_components=['Link', 'Line']):
     buses = n.buses.index
@@ -100,7 +69,28 @@ def incidence_matrix(n, branch_components=['Link', 'Line']):
                      .unstack().reindex(columns=buses).fillna(0).T)
                      for c in branch_components],
                      keys=branch_components, axis=1, sort=False)\
-            .reindex(columns=n.branches().loc[branch_components].index)
+            .reindex(columns=n.branches().loc[branch_components].index)\
+            .rename_axis(columns=['component', 'branch_i'])
+
+def cycles(n, dense=True, update=True):
+    if (not 'C' in n.__dir__()) | update:
+        find_cycles(n, dense=dense)
+        return n.C.T
+    else:
+        return n.C.T
+
+def active_cycles(n, snapshot):
+    f = pd.concat([n.lines_t.p0.loc[snapshot], n.links_t.p0.loc[snapshot]],
+              keys=['Line', 'Link'])
+
+    # copy original links
+    orig_links = n.links.copy()
+    # modify current links
+    n.links = n.links[f.Link.abs() >= 1e-8]
+    C = cycles(n, update=True)
+    # reassign original links
+    n.links = orig_links
+    return C.reindex(columns=n.branches().index, fill_value=0)
 
 
 def impedance(n, branch_components=['Line', 'Link'], snapshot=None):
@@ -110,8 +100,8 @@ def impedance(n, branch_components=['Line', 'Link'], snapshot=None):
     _z = [n.lines.x_pu_eff.where(n.lines.carrier == 'AC', n.lines.r_pu_eff)]
     z = pd.concat(_z, keys=["Line"])
 
-    if branch_components == ['Line']:
-        return z.loc['Line']
+    if (branch_components == ['Line']) | n.links.empty :
+        return z
     if snapshot is None:
         logger.warn('Link in argument "branch_components", but no '
                         'snapshot given. Falling back to first snapshot')
@@ -130,7 +120,6 @@ def impedance(n, branch_components=['Line', 'Link'], snapshot=None):
     if C_mix.empty:
         omega = f[['Link']]
     elif z.empty:
-        logger.info("z is empty")
         omega = null(C_mix[['Link']] @ diag(f[['Link']]))[0]
     else:
         omega = - pinv(C_mix[['Link']] @ diag(f[['Link']])) \
@@ -141,7 +130,7 @@ def impedance(n, branch_components=['Line', 'Link'], snapshot=None):
     return pd.concat([z, omega]).loc[branch_components]
 
 
-def susceptance(n, branch_components=['Line', 'Link'], snapshot=None):
+def admittance(n, branch_components=['Line', 'Link'], snapshot=None):
     return (1/impedance(n, branch_components, snapshot))\
             .replace([np.inf, -np.inf], 0)
 
@@ -149,9 +138,21 @@ def susceptance(n, branch_components=['Line', 'Link'], snapshot=None):
 def PTDF(n, branch_components=['Line'], snapshot=None):
     n.calculate_dependent_values()
     K = incidence_matrix(n, branch_components)
-    Omega = diag(susceptance(n, branch_components, snapshot))
-    return Omega.dot(K.T).dot(pinv(K.dot(Omega).dot(K.T)))
+    y = admittance(n, branch_components, snapshot)
+    return diag(y) @ K.T @ pinv(K @ diag(y) @ K.T)
 
+
+def Ybus(n, branch_components=['Line', 'Link'], snapshot=None):
+    K = incidence_matrix(n, branch_components)
+    y = admittance(n, branch_components, snapshot)
+    return K @ diag(y) @ K.T
+
+
+def Zbus(n, branch_components=['Line', 'Link'], snapshot=None):
+    return pinv(Ybus(n, branch_components, snapshot))
+
+
+# %% power system
 
 def network_injection(n, snapshots=None, branch_components=['Link', 'Line']):
     """
@@ -201,19 +202,21 @@ def power_production(n, snapshots=None,
     if snapshots is None:
         snapshots = n.snapshots.rename('snapshot')
     if 'p_plus' not in n.buses_t or update:
-        n.buses_t.p_plus = (sum(n.pnl(c).p.T
-                            .clip_lower(0)
+        n.buses_t.p_plus = (sum(n.pnl(c).p
+                            .mul(n.df(c).sign).T
+                            .clip(lower=0)
                             .assign(bus=n.df(c).bus)
                             .groupby('bus').sum()
                             .reindex(index=n.buses.index, fill_value=0).T
                             for c in components)
                             .rename_axis('source', axis=1))
     if 'p_plus_per_carrier' not in n.buses_t or update:
-        n.buses_t.p_plus_per_carrier =  (
+        n.buses_t.p_plus_per_carrier = (
                 pd.concat([(n.pnl(c).p.T
-                .assign(carrier=n.df(c).carrier, bus=n.df(c).bus)
-                .groupby(['bus', 'carrier']).sum().T
-                .where(lambda x: x > 0)) for c in components], axis=1)
+                            .assign(carrier=n.df(c).carrier, bus=n.df(c).bus)
+                            .groupby(['bus', 'carrier']).sum().T
+                            .where(lambda x: x > 0))
+                          for c in components], axis=1)
                 .rename_axis(['source', 'sourcetype'], axis=1))
 
     if per_carrier:
@@ -229,7 +232,7 @@ def power_demand(n, snapshots=None,
     if 'p_minus' not in n.buses_t or update:
         n.buses_t.p_minus = (sum(n.pnl(c).p.T
                              .mul(n.df(c).sign, axis=0)
-                             .clip_upper(0)
+                             .clip(upper=0)
                              .assign(bus=n.df(c).bus)
                              .groupby('bus').sum()
                              .reindex(index=n.buses.index, fill_value=0).T
@@ -243,8 +246,8 @@ def power_demand(n, snapshots=None,
             assert (intersc.empty), (
                     'Carrier names {} of compoents are not unique'
                     .format(intersc))
-        n.loads = n.loads.assign(carrier = 'load')
-        n.buses_t.p_minus_per_carrier =  -(
+        n.loads = n.loads.assign(carrier='load')
+        n.buses_t.p_minus_per_carrier = -(
                 pd.concat([(n.pnl(c).p.T
                 .mul(n.df(c).sign, axis=0)
                 .assign(carrier=n.df(c).carrier, bus=n.df(c).bus)
@@ -300,28 +303,13 @@ def expand_by_source_type(ds, n, components=['Generator', 'StorageUnit'],
 
     """
     sns = ds.index.unique('snapshot')
-    share_per_bus_carrier = (power_production(n, sns, per_carrier=True)
-                             .div(power_production(n, sns),
-                                  level='source')
-                             .swaplevel(axis=1))
-    if as_categoricals:
-        share_per_bus_carrier = share_per_bus_carrier.pipe(set_cats, n, axis=1)
-
-    share_per_bus_carrier = share_per_bus_carrier\
-                            [lambda x: x>cut_lower_share].unstack()\
-                            .dropna()\
-                            .reset_index(['sourcetype', 'source'],
-                                         name='share')
-
-    ds = ds.reset_index(ds.index.names[1:], name='allocation')\
-           .pipe(to_dask, use_dask)
-    return ds.merge(share_per_bus_carrier, on=['snapshot', 'source'],
-                    **merge_kwargs) \
-            .eval('allocation = allocation * share') \
-            .pipe(compute_if_dask, use_dask) \
-            .set_index(['sourcetype'] + list(ds.columns[:-1]), append=True)\
-            .allocation.dropna()\
-            .sort_index(level=0, sort_remaining=False)
+    share_per_bus_carrier = power_production(n, sns, per_carrier=True) \
+                              .div(power_production(n, sns), level='source').T \
+                              [lambda x: x>cut_lower_share] \
+                              .stack() \
+                              .reorder_levels(['snapshot', 'source',
+                                               'sourcetype'])
+    return (share_per_bus_carrier * ds).dropna()
 
 
 def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
@@ -352,29 +340,12 @@ def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
 
     """
     sns = ds.index.unique('snapshot')
-    share_per_bus_carrier = (power_demand(n, sns, per_carrier=True)
-                             .div(power_demand(n, sns),
-                                  level='sink')
-                             .swaplevel(axis=1))
-
-    if as_categoricals:
-        share_per_bus_carrier = share_per_bus_carrier.pipe(set_cats, n, axis=1)
-
-    share_per_bus_carrier = share_per_bus_carrier\
-                            [lambda x: x>cut_lower_share].unstack()\
-                            .dropna()\
-                            .reset_index(['sinktype', 'sink'], name='share')
-
-    ds = ds.reset_index(ds.index.names[1:], name='allocation')\
-           .pipe(to_dask, use_dask)
-    return ds.merge(share_per_bus_carrier, on=['snapshot', 'sink'],
-                    **merge_kwargs)\
-            .eval('allocation = allocation * share') \
-            .pipe(compute_if_dask, use_dask) \
-            .set_index(['sinktype'] + list(ds.columns[:-1]), append=True)\
-            .allocation.dropna()\
-            .sort_index(level=0, sort_remaining=False)
-
+    share_per_bus_carrier = power_demand(n, sns, per_carrier=True) \
+                             .div(power_demand(n, sns), level='sink').T \
+                             [lambda x: x>cut_lower_share] \
+                             .stack() \
+                             .reorder_levels(['snapshot', 'sink', 'sinktype'])
+    return (share_per_bus_carrier * ds).dropna()
 
 # %% Helper functions, not the right place in this module, but okay
 
@@ -393,8 +364,10 @@ def to_dask(df, use_dask=False):
 
 
 def _to_categorical_index(df, axis=0):
-    to_cat_if_obj = lambda i: (i.astype('category')
-                                          if i.is_object() else i)
+
+    def to_cat_if_obj(i):
+        return i.astype('category') if i.is_object() else i
+
     if df.axes[axis].nlevels > 1:
         return df.set_axis(
                 df.axes[axis]
@@ -436,12 +409,12 @@ def set_cats(df, n=None, axis=0):
     if n is None:
         return df.pipe(_to_categorical_index, axis=axis)
     buses = n.buses.index
-    branch_names = n.branches().index.levels[1]
+    branch_i = n.branches().index.levels[1]
     bus_lv_names = ['sink', 'source', 'bus0', 'bus1', 'in', 'out']
     return df.pipe(_to_categorical_index, axis=axis)\
              .pipe(_set_categories_for_level, bus_lv_names, buses, axis=axis)\
-             .pipe(_set_categories_for_level, ['branch_name'],
-                   branch_names, axis=axis)
+             .pipe(_set_categories_for_level, ['branch_i'],
+                   branch_i, axis=axis)
 
 def droplevel(df, levels, axis=0):
     ax = df.axes[axis]
@@ -534,58 +507,33 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
         Whether to use downstream or upstream method.
 
     """
+    lower = lambda df: df.clip(upper=0)
+    upper = lambda df: df.clip(lower=0)
 
-    n.calculate_dependent_values()
-    buses = n.buses.index
-    f_in = (pd.concat([n.pnl(c).p0.loc[snapshot] for c in branch_components],
-                keys=branch_components, sort=True))
-    f_out = (pd.concat([-n.pnl(c).p1.loc[snapshot] for c in branch_components],
-                keys=branch_components, sort=True))
-    f = (n.branches().loc[branch_components]
-         .assign(flow=f_in)
-         .rename_axis(['component', 'branch_name'])
-         .set_index(['bus0', 'bus1'], append=True)['flow']
-         .pipe(set_cats, n))
+    f = pd.concat([n.pnl(c).p0.loc[snapshot] for c in branch_components],
+                  keys=branch_components, sort=True) \
+          .rename_axis(['component', 'branch_i'])
 
     p = network_injection(n, snapshot, branch_components).T
-    K = incidence_matrix(n, branch_components)
-#    set incidence matrix in direction of flow
-    K_dir = K.mul(np.sign(f_in))
-    f_in = f_in.abs().to_frame()
-    f_out = f_out.abs().to_frame()
-
-    n_in = K_dir.clip_upper(0).dot(f_in).abs()  # network inflow
-    n_out = K_dir.clip_lower(0).dot(f_out).abs()  # network outflow
     if aggregated:
-        p_in = p.clip_lower(0)  # nodal inflow
-        p_out = p.clip_upper(0).abs()  # nodal outflow
+        p_in = p.clip(lower=0)  # nodal inflow
+        p_out = p.clip(upper=0).abs()  # nodal outflow
     else:
         p_in = power_production(n, [snapshot]).T
         p_out = power_demand(n, [snapshot]).T
 
-    F_in = (p_in + n_in)[snapshot]
-    F_out = (p_out + n_out)[snapshot]
+    K = incidence_matrix(n, branch_components)
 
-    nzero_i = F_in[F_in != 0].index
-#   F_in == F_out == (p_out + n_out)[snapshot]
+    K_dir = K * sign(f)
 
-    # flows from bus (column) to bus (index):
-    F = (K_dir.dot(diag(f_in)).clip_lower(0).dot(K_dir.T).clip_upper(0).abs()
-         .rename_axis('in').rename_axis('out', axis=1)).T
+    effciency = n.branches()['efficiency'].fillna(1)\
+                 .rename_axis(['component', 'branch_i'])
+    K_loss_dir = upper(K_dir) + lower(K_dir) * effciency
 
-    # downstream
-    Q = (inv((diag(F_in) - F).loc[nzero_i, nzero_i])
-         .dot(diag(p_in.reindex(nzero_i)))
-         .reindex(index=buses, columns=buses, fill_value=0)
-         .round(10))
-    # upstream
-    R = (inv((diag(F_out) - F.T).loc[nzero_i, nzero_i])
-         .dot(diag(p_out.reindex(nzero_i)))
-         .reindex(index=buses, columns=buses, fill_value=0)
-         .round(10))
+#    Tau = lower(K_loss_dir) * f @ K.T + diag(p_in)
 
-    #  equation (12)
-#      (Q.T.dot(diag(p_out)).T == R.T.dot(diag(p_in))).all().all()
+    Q = inv(lower(K_loss_dir) * f @ K.T + diag(p_in)) * p_in[snapshot]
+    R = inv(upper(K_loss_dir) * f @ K.T + diag(p_out)) * p_out[snapshot]
 
     if not normalized and per_bus:
         Q = Q.mul(p_out[snapshot], axis=0)
@@ -596,11 +544,13 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
             R += diag(self_consumption(n, snapshot))
 
     q = (Q.rename_axis('in').rename_axis('source', axis=1)
-         .stack()[lambda ds: ds != 0].swaplevel(0)#.sort_index()
+         .replace(0, np.nan)
+         .stack().swaplevel(0)#.sort_index()
          .rename('upstream').pipe(set_cats, n))
 
     r = (R.rename_axis('out').rename_axis('sink', axis=1)
-         .stack()[lambda ds: ds != 0]#.sort_index()
+         .replace(0, np.nan)
+         .stack()#.sort_index()
          .rename('downstream').pipe(set_cats, n))
 
 
@@ -612,33 +562,25 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
             T = T.downstream if downstream else T.upstream
 
     else:
+        f = (n.branches().loc[branch_components]
+               .assign(flow=f)
+               .rename_axis(['component', 'branch_i'])
+               .set_index(['bus0', 'bus1'], append=True)['flow']
+               .pipe(set_cats, n))
 
         # absolute flow with directions
-        f_dir = (pd.concat([f[f > 0], -f[f < 0].swaplevel('bus0', 'bus1')
-                 .rename_axis(['component', 'branch_name', 'bus0', 'bus1'])])
-                 .rename_axis(['component', 'branch_name', 'in', 'out']))
+        f_dir = pd.concat(
+                [f[f > 0].rename_axis(index={'bus0':'in', 'bus1': 'out'}),
+                 f[f < 0].swaplevel()
+                         .rename_axis(index={'bus0':'out', 'bus1': 'in'})])
+
 
         if normalized:
-            f_dir = (f_dir.groupby(level=['component', 'branch_name'])
-                     .transform(lambda ds: ds/ds.sum()))
+            f_dir = (f_dir.groupby(level=['component', 'branch_i'])
+                     .transform(lambda ds: ds/ds.abs().sum()))
 
-        # signs of the absolute flow relativ to line direction
-        f_sign = np.sign(f).set_axis(f.index.droplevel(['bus0', 'bus1']),
-                                     inplace=0).rename('sign')
-
-        merge_kwargs = {'copy':False, 'sort':False}
-
-        # for each source mulitply outgoing flow (at destiny) with local
-        # ingoing line flow, for each sink ingoing flow at origin with local
-        # outgoing line flow. All in respect to line direction
-        T = (f_dir.reset_index()
-             .merge(q.reset_index(), on='in', **merge_kwargs)
-             .merge(r.reset_index(), on='out', **merge_kwargs)
-             .merge(f_sign.reset_index(), on=['component', 'branch_name'],
-                    **merge_kwargs)
-             .set_index(['source', 'sink', 'component', 'branch_name'])
-             .eval('upstream * flow *  downstream * sign'))
-
+        T = (q * f_dir * r).dropna().droplevel(['in', 'out'])\
+            .reorder_levels(['source', 'sink', 'component', 'branch_i'])
     return pd.concat([T], keys=[snapshot], names=['snapshot'])
 
 
@@ -686,8 +628,8 @@ def marginal_participation(n, snapshot=None, q=0.5, normalized=False,
     snapshot = n.snapshots[0] if snapshot is None else snapshot
     H = PTDF(n)
     p = n.buses_t.p.loc[snapshot]
-    p_plus = p.clip_lower(0)
-    p_minus = p.clip_upper(0)
+    p_plus = p.clip(lower=0)
+    p_minus = p.clip(upper=0)
     f = n.lines_t.p0.loc[snapshot]
 #   unbalanced flow from positive injection:
     f_plus = H @ p_plus
@@ -704,10 +646,10 @@ def marginal_participation(n, snapshot=None, q=0.5, normalized=False,
              .stack().round(8)[lambda ds:ds != 0])
     else:
         Q = (Q.rename_axis('bus')
-             .rename_axis(['component', 'branch_name'], axis=1)
+             .rename_axis(['component', 'branch_i'], axis=1)
              .unstack()
              .round(8)[lambda ds:ds != 0]
-             .reorder_levels(['bus', 'component', 'branch_name'])
+             .reorder_levels(['bus', 'component', 'branch_i'])
              .sort_index())
     return pd.concat([Q], keys=[snapshot], names=['snapshot'])
 
@@ -739,8 +681,8 @@ def virtual_injection_pattern(n, snapshot=None, normalized=False, per_bus=False,
     snapshot = n.snapshots[0] if snapshot is None else snapshot
     H = PTDF(n)
     p = n.buses_t.p.loc[snapshot]
-    p_plus = p.clip_lower(0)
-    p_minus = p.clip_upper(0)
+    p_plus = p.clip(lower=0)
+    p_minus = p.clip(upper=0)
     f = n.lines_t.p0.loc[snapshot]
     if downstream:
         indiag = diag(p_plus)
@@ -763,9 +705,9 @@ def virtual_injection_pattern(n, snapshot=None, normalized=False, per_bus=False,
             # normalized colorvectors
             Q /= f
         Q = (Q.rename_axis('bus') \
-              .rename_axis(["component", 'branch_name'], axis=1)
+              .rename_axis(["component", 'branch_i'], axis=1)
               .unstack().round(8)
-              .reorder_levels(['bus', 'component', 'branch_name'])
+              .reorder_levels(['bus', 'component', 'branch_i'])
               .sort_index()
               [lambda ds: ds != 0])
     return pd.concat([Q], keys=[snapshot], names=['snapshot'])
@@ -781,15 +723,15 @@ def optimal_flow_shares(n, snapshot, method='min', downstream=True,
     from scipy.optimize import minimize
     H = PTDF(n)
     p = n.buses_t.p.loc[snapshot]
-    p_plus = p.clip_lower(0)
-    p_minus = p.clip_upper(0)
+    p_plus = p.clip(lower=0)
+    p_minus = p.clip(upper=0)
     pp = p.to_frame().dot(p.to_frame().T).div(p).fillna(0)
     if downstream:
         indiag = diag(p_plus)
         offdiag = (p_minus.to_frame().dot(p_plus.to_frame().T)
                    .div(p_plus.sum()))
-        pp = pp.clip_upper(0).add(diag(pp)).mul(np.sign(p.clip_lower(0)))
-        bounds = pd.concat([pp.stack(), pp.stack().clip_lower(0)], axis=1,
+        pp = pp.clip(upper=0).add(diag(pp)).mul(np.sign(p.clip(lower=0)))
+        bounds = pd.concat([pp.stack(), pp.stack().clip(lower=0)], axis=1,
                            keys=['lb', 'ub'])
 
 #                   .pipe(lambda df: df - np.diagflat(np.diag(df)))
@@ -797,8 +739,8 @@ def optimal_flow_shares(n, snapshot, method='min', downstream=True,
         indiag = diag(p_minus)
         offdiag = (p_plus.to_frame().dot(p_minus.to_frame().T)
                    .div(p_minus.sum()))
-        pp = pp.clip_lower(0).add(diag(pp)).mul(-np.sign(p.clip_upper(0)))
-        bounds = pd.concat([pp.stack().clip_upper(0), pp.stack()], axis=1,
+        pp = pp.clip(lower=0).add(diag(pp)).mul(-np.sign(p.clip(upper=0)))
+        bounds = pd.concat([pp.stack().clip(upper=0), pp.stack()], axis=1,
                            keys=['lb', 'ub'])
     x0 = (indiag + offdiag).stack()
     N = len(n.buses)
@@ -851,10 +793,10 @@ def zbus_transmission(n, snapshot=None):
 
 
     # linearised method, start from linearised admittance matrix
-    Omega =  -1.j * susceptance(n) #+ 1/n.branches().loc[['Line']].r_pu_eff
+    y = 1.j * admittance(n, branch_components=['Line'])
     K = incidence_matrix(n, branch_components=['Line'])
 
-    Y = K @ diag(Omega) @ K.T  # weighted Laplacian Y = B
+    Y = K @ diag(y) @ K.T  # Ybus matrix
 
     Z = pinv(Y)
     # set angle of slackbus to 0
@@ -864,6 +806,8 @@ def zbus_transmission(n, snapshot=None):
     V = n.buses.v_nom.to_frame(snapshot) * \
         (1 + 1.j * n.buses_t.v_ang.loc[[snapshot]].T).rename_axis('bus0')
     I = Y @ V
+    assert all((I * V).apply(np.real)
+                == network_injection(n, snapshots=snapshot).T)
 
     # -------------------------------------------------------------------------
     # nonlinear method start with full admittance matrix from pypsa
@@ -877,26 +821,25 @@ def zbus_transmission(n, snapshot=None):
 
     # y_sh = n.lines.set_index(['bus0', 'bus1']).eval('g_pu + 1.j * b_pu')
 
-    # Z is the inverse of the weighted laplacian
-    A = (K * Omega).T @ Z
+    A = (K * y).T @ Z # == diag(y) @ K.T @ Z == PTDF
          #+ Z.mul(y_sh, axis=0, level=0).set_axis(n.lines.index, inplace=False)
     A = A.applymap(np.real_if_close)
     branches = ['Line']
     f = pd.concat([n.pnl(b).p0.loc[snapshot] for b in branches], keys=branches)
 
-    V_l_at = lambda bus: pd.concat(
-                [n.df(b)[bus].map(V[snapshot])
-                 / n.df(b)[bus].map(n.buses.v_nom ** 2)
-                      for b in branches], keys=branches)
+    V_l_at = lambda bus: pd.concat([n.df(b)[bus].map(V[snapshot])
+                                    / n.df(b)[bus].map(n.buses.v_nom ** 2)
+                                    for b in branches], keys=branches)
 
     V_l = V_l_at('bus0').where(f > 0, V_l_at('bus1'))
 
+    # q = PTDF(n) * p[snapshot]
     q = A.mul(V_l, axis=0)\
          .mul(I[snapshot]) \
          .applymap(np.real) \
          .stack() \
-         .rename_axis(['component', 'branch_name', 'bus']) \
-         .reorder_levels(['bus', 'component', 'branch_name'])\
+         .rename_axis(['component', 'branch_i', 'bus']) \
+         .reorder_levels(['bus', 'component', 'branch_i'])\
          .sort_index()
 
     return pd.concat([q], keys=[snapshot], names=['snapshot'])
@@ -1029,6 +972,7 @@ def flow_allocation(n, snapshots=None, method='Average participation',
     """
 #    raise error if there are no flows
 
+    snapshots = n.snapshots if snapshots is None else snapshots
     snapshots = snapshots if isinstance(snapshots, Iterable) else [snapshots]
     if n.lines_t.p0.shape[0] == 0:
         raise ValueError('Flows are not given by the network, '
