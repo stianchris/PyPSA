@@ -225,11 +225,15 @@ def plot(n, margin=0.05, ax=None,
     branch_collections = []
     lines_i = n.lines.index
     links_i = n.links.index
+    branches_i = n.branches().index
 
-    branch_widths = pd.concat(
-        [pd.Series(line_widths, lines_i).fillna(defs.loc['width', 'Line']),
-         pd.Series(link_widths, links_i).fillna(defs.loc['width', 'Link'])],
-         keys=['Line', 'Link'])
+    if isinstance(line_widths, pd.Series) and isinstance(line_widths.index, pd.MultiIndex):
+        branch_widths = line_widths.reindex(branches_i, fill_value=0)
+    else:
+        branch_widths = pd.concat(
+            [pd.Series(line_widths, lines_i).fillna(defs.loc['width', 'Line']),
+            pd.Series(link_widths, links_i).fillna(defs.loc['width', 'Link'])],
+            keys=['Line', 'Link'])
 
     branch_colors = pd.concat(
         [pd.Series(line_colors, lines_i).fillna(defs.loc['color', 'Line']),
@@ -237,14 +241,15 @@ def plot(n, margin=0.05, ax=None,
          keys=['Line', 'Link'])
 
     if flow is not None:
+        flow = get_flow_data_from_arg(flow, n, branch_components) \
+                    .reindex(branches_i, fill_value=0)
         arrow_scale = (len(n.branches()) + 100) / branch_widths
-        flow = get_flow_data_from_arg(flow, n, branch_components)/arrow_scale
+        flow = flow.div(arrow_scale)
+        branch_widths = (5 * flow.abs()).pipe(np.sqrt)#.clip(lower=branch_widths)
         # set a rough estimate of flow_scale
         arrows = directed_flow(n, flow, ax=ax, branch_colors=branch_colors)
         branch_collections.append(arrows)
         #fix the ratio of arrow width and line width
-        branch_widths = flow.abs().pipe(np.sqrt).clip(lower=branch_widths)*10
-
     if not isinstance(line_cmap, dict):
         line_cmap = {'Line': line_cmap}
 
@@ -425,9 +430,10 @@ def directed_flow(n, flow, ax=None,
                        'y1': n.df(l).bus0.map(n.buses.y),
                        'x2': n.df(l).bus1.map(n.buses.x),
                        'y2': n.df(l).bus1.map(n.buses.y)})
-                      for l in branch_comps], keys=branch_comps)
+                      for l in branch_comps], keys=branch_comps)\
+                .reindex(flow.index)
     fdata['arrowsize'] = (flow.abs().pipe(np.sqrt)
-                          .clip(lower=1e-8) / 2.)
+                          .clip(lower=1e-8))
     fdata['direction'] = np.sign(flow)
     fdata['linelength'] = (np.sqrt((fdata.x1 - fdata.x2)**2. +
                            (fdata.y1 - fdata.y2)**2))
@@ -438,15 +444,16 @@ def directed_flow(n, flow, ax=None,
     fdata.loc[fdata.direction == -1., ['x1', 'x2', 'y1', 'y2']] = \
         fdata.loc[fdata.direction == -1., ['x2', 'x1', 'y2', 'y1']].values
 
-    fdata['arrows'] = (
-            fdata[(fdata.linelength > 0.) & (~fdata.arrowtolarge)]
-            .apply(lambda ds:
-                   FancyArrow(ds.x1, ds.y1,
-                              0.6*(ds.x2 - ds.x1) - ds.arrowsize
-                              * 0.75 * (ds.x2 - ds.x1) / ds.linelength,
-                              0.6 * (ds.y2 - ds.y1) - ds.arrowsize
-                              * 0.75 * (ds.y2 - ds.y1)/ds.linelength,
-                              head_width=ds.arrowsize), axis=1))
+    if ((fdata.linelength > 0.) & (~fdata.arrowtolarge)).any():
+        fdata['arrows'] = (
+                fdata[(fdata.linelength > 0.) & (~fdata.arrowtolarge)]
+                .apply(lambda ds:
+                       FancyArrow(ds.x1, ds.y1,
+                                  0.6*(ds.x2 - ds.x1) - ds.arrowsize
+                                  * 0.75 * (ds.x2 - ds.x1) / ds.linelength,
+                                  0.6 * (ds.y2 - ds.y1) - ds.arrowsize
+                                  * 0.75 * (ds.y2 - ds.y1)/ds.linelength,
+                                  head_width=ds.arrowsize), axis=1))
     fdata.loc[(fdata.linelength > 0.) & (fdata.arrowtolarge), 'arrows'] = \
         (fdata[(fdata.linelength > 0.) & (fdata.arrowtolarge)]
          .apply(lambda ds:
@@ -476,8 +483,10 @@ def directed_flow(n, flow, ax=None,
 
 def iplot(network, fig=None, bus_colors='grey',
           bus_colorscale=None, bus_colorbar=None, bus_sizes=10, bus_text=None,
-          line_colors=None, line_widths=2, line_text=None, title="",
-          geoscope='europe', branch_components=['Line', 'Link'], iplot=True,
+          line_colors=None, line_widths=2, line_text=None,
+          link_colors=None, link_widths=2, link_text=None,
+          title="", geoscope='europe',
+          branch_components=['Line', 'Link'], iplot=True,
           jitter=None):
     """
     Plot the network buses and lines interactively using plotly.
@@ -551,10 +560,22 @@ def iplot(network, fig=None, bus_colors='grey',
     if bus_colorbar is not None:
         bus_trace['marker']['colorbar'] = bus_colorbar
 
-    line_colors = as_series(line_colors, network, branch_components,
-                            branch_defaults.loc['color'])
-    line_widths = as_series(line_widths, network, branch_components,
-                            branch_defaults.loc['width'])
+    lines_i = network.lines.index
+    links_i = network.links.index
+    branches_i = network.branches().index
+
+    if isinstance(line_widths, pd.Series) and isinstance(line_widths.index, pd.MultiIndex):
+        branch_widths = line_widths.reindex(branches_i, fill_value=0)
+    else:
+        branch_widths = pd.concat(
+            [pd.Series(line_widths, lines_i).fillna(defs.loc['width', 'Line']),
+            pd.Series(link_widths, links_i).fillna(defs.loc['width', 'Link'])],
+            keys=['Line', 'Link'])
+
+    branch_colors = pd.concat(
+        [pd.Series(line_colors, lines_i).fillna(defs.loc['color', 'Line']),
+         pd.Series(link_colors, links_i).fillna(defs.loc['color', 'Link'])],
+         keys=['Line', 'Link'])
 
     if line_text is not None:
         line_text = as_series(line_text, network, branch_components)
@@ -563,8 +584,8 @@ def iplot(network, fig=None, bus_colors='grey',
     shape_traces = []
 
     for c in network.iterate_components(branch_components):
-        l_widths = line_widths.loc[c.name]
-        l_colors = line_colors.loc[c.name]
+        l_widths = branch_widths.loc[c.name]
+        l_colors = branch_colors.loc[c.name]
 
         if line_text is None:
             l_text = c.name + ' ' + c.df.index

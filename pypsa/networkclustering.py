@@ -78,10 +78,19 @@ def aggregategenerators(network, busmap, with_time=True, carriers=None):
     columns = (set(attrs.index[attrs.static & attrs.status.str.startswith('Input')]) | {'weight'}) & set(generators.columns)
     grouper = [generators.bus, generators.carrier]
 
+    def aggregate_weighted_by(df1, df2):
+        if (df1 == df1.iloc[0]).all():
+            return df1.iloc[0]
+        else:
+            return (df1 * _normed(df2.reindex(df1.index))).sum()
+
     weighting = generators.weight.groupby(grouper, axis=0).transform(lambda x: (x/x.sum()).fillna(1.))
     generators['p_nom_max'] /= weighting
     generators['capital_cost'] *= weighting
-    strategies = {'p_nom_max': np.min, 'weight': np.sum, 'p_nom': np.sum, 'capital_cost': np.sum}
+    strategies = {'p_nom_max': np.min, 'weight': np.sum, 'p_nom': np.sum,
+                  'capital_cost': np.sum,
+                  'marginal_cost': lambda df: aggregate_weighted_by(df, generators['p_nom']),
+                  'efficiency': lambda df: aggregate_weighted_by(df, generators['p_nom'])}
     strategies.update((attr, _make_consense('Generator', attr))
                       for attr in columns.difference(strategies))
     new_df = generators.groupby(grouper, axis=0).agg(strategies)
@@ -119,7 +128,8 @@ def aggregateoneport(network, busmap, component, with_time=True, custom_strategi
 
     default_strategies = dict(p=np.sum, q=np.sum, p_set=np.sum, q_set=np.sum,
                               p_nom=np.sum, p_nom_max=np.sum, p_nom_min=np.sum,
-                              max_hours=aggregate_max_hours)
+                              max_hours=aggregate_max_hours,
+                              efficiency_store=aggregate_max_hours)
     strategies = {attr: default_strategies.get(attr, _make_consense(component, attr))
                   for attr in columns}
     strategies.update(custom_strategies)
@@ -181,6 +191,8 @@ def aggregatelines(network, buses, interlines, line_length_factor=1.0):
 
         voltage_factor = (np.asarray(network.buses.loc[l.bus0,'v_nom'])/v_nom_s)**2
         length_factor = (length_s/l['length'])
+
+#        import pdb; pdb.set_trace()
 
         data = dict(
             r=1./(voltage_factor/(length_factor * l['r'])).sum(),

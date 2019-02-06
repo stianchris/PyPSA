@@ -277,7 +277,7 @@ def self_consumption(n, snapshots=None, override=False):
 
 def expand_by_source_type(ds, n, components=['Generator', 'StorageUnit'],
                           as_categoricals=True, use_dask=False,
-                          cut_lower_share=1e-5, **merge_kwargs):
+                          cut_lower_share=1e-5):
     """
     Breakdown allocation into generation carrier type. These include carriers
     of all components specified by 'components'. Note that carrier names of all
@@ -309,12 +309,12 @@ def expand_by_source_type(ds, n, components=['Generator', 'StorageUnit'],
                               .stack() \
                               .reorder_levels(['snapshot', 'source',
                                                'sourcetype'])
-    return (share_per_bus_carrier * ds).dropna()
+    return (share_per_bus_carrier * ds).dropna().rename('allocation')
 
 
 def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
                         as_categoricals=True, use_dask=False,
-                        cut_lower_share=1e-5, **merge_kwargs):
+                        cut_lower_share=1e-5):
     """
     Breakdown allocation into demand types, e.g. Storage carriers and Load.
     These include carriers of all components specified by 'components'. Note
@@ -345,7 +345,7 @@ def expand_by_sink_type(ds, n, components=['Load', 'StorageUnit'],
                              [lambda x: x>cut_lower_share] \
                              .stack() \
                              .reorder_levels(['snapshot', 'sink', 'sinktype'])
-    return (share_per_bus_carrier * ds).dropna()
+    return (share_per_bus_carrier * ds).dropna().rename('allocation')
 
 # %% Helper functions, not the right place in this module, but okay
 
@@ -519,12 +519,12 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
         p_in = p.clip(lower=0)  # nodal inflow
         p_out = p.clip(upper=0).abs()  # nodal outflow
     else:
-        p_in = power_production(n, [snapshot]).T
-        p_out = power_demand(n, [snapshot]).T
+        p_in = power_production(n, [snapshot]).loc[snapshot]
+        p_out = power_demand(n, [snapshot]).loc[snapshot]
 
     K = incidence_matrix(n, branch_components)
 
-    K_dir = K * sign(f)
+    K_dir = K @ diag(sign(f))
 
     effciency = n.branches()['efficiency'].fillna(1)\
                  .rename_axis(['component', 'branch_i'])
@@ -532,12 +532,12 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
 
 #    Tau = lower(K_loss_dir) * f @ K.T + diag(p_in)
 
-    Q = inv(lower(K_loss_dir) * f @ K.T + diag(p_in)) * p_in[snapshot]
-    R = inv(upper(K_loss_dir) * f @ K.T + diag(p_out)) * p_out[snapshot]
+    Q = inv(lower(K_loss_dir) @ diag(f) @ K.T + diag(p_in)) @ diag(p_in)
+    R = inv(upper(K_loss_dir) @ diag(f) @ K.T + diag(p_out)) @ diag(p_out)
 
     if not normalized and per_bus:
-        Q = Q.mul(p_out[snapshot], axis=0)
-        R = R.mul(p_in[snapshot], axis=0)
+        Q = diag(p_out) @ Q
+        R = diag(p_in) @ R
         if aggregated:
             # add self-consumption
             Q += diag(self_consumption(n, snapshot))
@@ -546,12 +546,12 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
     q = (Q.rename_axis('in').rename_axis('source', axis=1)
          .replace(0, np.nan)
          .stack().swaplevel(0)#.sort_index()
-         .rename('upstream').pipe(set_cats, n))
+         .rename('upstream'))#.pipe(set_cats, n))
 
     r = (R.rename_axis('out').rename_axis('sink', axis=1)
          .replace(0, np.nan)
          .stack()#.sort_index()
-         .rename('downstream').pipe(set_cats, n))
+         .rename('downstream'))#.pipe(set_cats, n))
 
 
     if per_bus:
@@ -579,8 +579,11 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
             f_dir = (f_dir.groupby(level=['component', 'branch_i'])
                      .transform(lambda ds: ds/ds.abs().sum()))
 
-        T = (q * f_dir * r).dropna().droplevel(['in', 'out'])\
-            .reorder_levels(['source', 'sink', 'component', 'branch_i'])
+        T = (q * f_dir * r).dropna() \
+            .droplevel(['in', 'out'])\
+            .reorder_levels(['source', 'sink', 'component', 'branch_i'])\
+            .rename('allocation')
+
     return pd.concat([T], keys=[snapshot], names=['snapshot'])
 
 
