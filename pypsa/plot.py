@@ -196,7 +196,8 @@ def plot(n, margin=0.05, ax=None,
                           labels=labels,
                           loc=2, framealpha=1))
 
-        bus_sizes = bus_sizes.sort_index(level=0, sort_remaining=False)
+        bus_sizes = bus_sizes.sort_index(level=0, sort_remaining=False) \
+                          * boundary_area_factor(ax)**2
 
         patches = []
         for b_i in bus_sizes.index.unique(0):
@@ -247,7 +248,8 @@ def plot(n, margin=0.05, ax=None,
         flow = flow.div(arrow_scale)
         branch_widths = (5 * flow.abs()).pipe(np.sqrt)#.clip(lower=branch_widths)
         # set a rough estimate of flow_scale
-        arrows = directed_flow(n, flow, ax=ax, branch_colors=branch_colors)
+        arrows = directed_flow(n, flow, x=x, y=y, ax=ax,
+                               branch_colors=branch_colors)
         branch_collections.append(arrows)
         #fix the ratio of arrow width and line width
     if not isinstance(line_cmap, dict):
@@ -293,7 +295,7 @@ def plot(n, margin=0.05, ax=None,
             l_collection.autoscale()
 
         ax.add_collection(l_collection)
-        l_collection.set_zorder(1)
+        l_collection.set_zorder(2)
 
         branch_collections.append(l_collection)
 
@@ -303,7 +305,7 @@ def plot(n, margin=0.05, ax=None,
     ax.autoscale_view()
     if basemap_present:
         ax.axis('off')
-    if cartopy_present:
+    if cartopy_present and basemap:
         ax.outline_patch.set_visible(False)
 
     ax.set_title(title)
@@ -321,23 +323,6 @@ def as_series(value, index, default):
     return pd.Series(value, index).fillna(default)
 
 
-
-#def as_series(ser, n, components, default=np.nan):
-#    index = n.branches().loc[idx[components, :], :].index
-#    if not isinstance(ser, (pd.Series, dict)):
-#        ser = pd.Series(ser, index=index)
-#    elif isinstance(ser, pd.Series) & isinstance(ser.index, pd.MultiIndex):
-#        ser = ser.reindex(index)
-#    else:
-#        ser = (pd.concat([pd.Series(ser).reindex(index, level=0).dropna(),
-#                         pd.Series(ser).reindex(index, level=1).dropna()],
-#                         sort=False)[lambda ds: ~ds.index.duplicated()]
-#               .reindex(index))
-#    if isinstance(default, (dict, pd.Series)):
-#        default = pd.Series(default).reindex(index, level=0)
-#    return ser.where(ser.notnull(), default)
-
-
 def compute_bbox_with_margins(margin, x, y):
     # set margins
     pos = np.asarray((x, y))
@@ -345,6 +330,26 @@ def compute_bbox_with_margins(margin, x, y):
     xy1 = minxy - margin*(maxxy - minxy)
     xy2 = maxxy + margin*(maxxy - minxy)
     return tuple(xy1), tuple(xy2)
+
+
+def boundary_area_factor(ax):
+    """
+    Helper function to get the area scale of the current projection in
+    reference to the default projection.
+    """
+    if not 'projection' in ax.__dict__:
+        return 1
+    if ax.projection is ccrs.PlateCarree():
+        return 1
+    x1, x2, y1, y2 = ax.get_extent()
+    pbounds = \
+        ccrs.PlateCarree().transform_points(ax.projection,
+                    np.array([x1, x2]), np.array([y1, y2]))
+
+    return np.sqrt(abs((x2 - x1) * (y2 - y1))
+                   /abs((pbounds[0] - pbounds[1])[:2].prod()))
+
+
 
 
 def draw_map(network=None, jitter=None, ax=None, boundaries=None,
@@ -378,10 +383,15 @@ def draw_map(network=None, jitter=None, ax=None, boundaries=None,
         resolution = '50m' if isinstance(basemap, bool) else basemap
         assert resolution in ['10m', '50m', '110m'], (
                 "Resolution has to be one of '10m', '50m', '110m'")
+        transformed = pd.DataFrame(
+                    ax.projection.transform_points(
+                        ccrs.PlateCarree(), x.values, y.values),
+                        columns=['x', 'y', 'z'], index=network.buses.index)
+        x, y = transformed.x, transformed.y
         ax.set_extent([x1, x2, y1, y2], crs=ccrs.PlateCarree())
-        ax.coastlines(linewidth=0.4, zorder=-1, resolution=resolution)
+#        ax.coastlines(linewidth=0.4, zorder=-1, resolution=resolution)
         border = cartopy.feature.BORDERS.with_scale(resolution)
-        ax.add_feature(border, linewidth=0.3)
+#        ax.add_feature(border, linewidth=0.3)
 
     return x, y
 
@@ -415,7 +425,7 @@ def get_generation_data_from_arg(generation, n):
                      [lambda ds: ds>0] / 1e3)
 
 
-def directed_flow(n, flow, ax=None,
+def directed_flow(n, flow, x=None, y=None, ax=None,
                   branch_colors='darkgreen', branch_comps=['Line', 'Link']):
     """
     Helper function to generate arrows from flow data.
@@ -424,16 +434,18 @@ def directed_flow(n, flow, ax=None,
     from matplotlib.patches import FancyArrow
     if ax is None:
         ax = plt.gca()
+    x = n.buses.x if x is None else x
+    y = n.buses.y if y is None else y
 #    set the scale of the arrowsizes
     fdata = pd.concat([pd.DataFrame(
-                      {'x1': n.df(l).bus0.map(n.buses.x),
-                       'y1': n.df(l).bus0.map(n.buses.y),
-                       'x2': n.df(l).bus1.map(n.buses.x),
-                       'y2': n.df(l).bus1.map(n.buses.y)})
+                      {'x1': n.df(l).bus0.map(x),
+                       'y1': n.df(l).bus0.map(y),
+                       'x2': n.df(l).bus1.map(x),
+                       'y2': n.df(l).bus1.map(y)})
                       for l in branch_comps], keys=branch_comps)\
                 .reindex(flow.index)
     fdata['arrowsize'] = (flow.abs().pipe(np.sqrt)
-                          .clip(lower=1e-8))
+                          .clip(lower=1e-8)) * boundary_area_factor(ax)
     fdata['direction'] = np.sign(flow)
     fdata['linelength'] = (np.sqrt((fdata.x1 - fdata.x2)**2. +
                            (fdata.y1 - fdata.y2)**2))

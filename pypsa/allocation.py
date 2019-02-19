@@ -510,9 +510,17 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
     lower = lambda df: df.clip(upper=0)
     upper = lambda df: df.clip(lower=0)
 
-    f = pd.concat([n.pnl(c).p0.loc[snapshot] for c in branch_components],
+
+    f0 = pd.concat([n.pnl(c).p0.loc[snapshot] for c in branch_components],
                   keys=branch_components, sort=True) \
           .rename_axis(['component', 'branch_i'])
+    f1 = pd.concat([n.pnl(c).p1.loc[snapshot] for c in branch_components],
+                  keys=branch_components, sort=True) \
+          .rename_axis(['component', 'branch_i'])
+
+    f_up = f0.where(f0 > 0, - f1)
+    f_lo = f0.where(f0 < 0,  - f1)
+
 
     p = network_injection(n, snapshot, branch_components).T
     if aggregated:
@@ -524,16 +532,12 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
 
     K = incidence_matrix(n, branch_components)
 
-    K_dir = K @ diag(sign(f))
-
-    effciency = n.branches()['efficiency'].fillna(1)\
-                 .rename_axis(['component', 'branch_i'])
-    K_loss_dir = upper(K_dir) + lower(K_dir) * effciency
+    K_dir = K @ diag(sign(f_up))
 
 #    Tau = lower(K_loss_dir) * f @ K.T + diag(p_in)
 
-    Q = inv(lower(K_loss_dir) @ diag(f) @ K.T + diag(p_in)) @ diag(p_in)
-    R = inv(upper(K_loss_dir) @ diag(f) @ K.T + diag(p_out)) @ diag(p_out)
+    Q = inv(lower(K_dir) @ diag(f_lo) @ K.T + diag(p_in)) @ diag(p_in)
+    R = inv(upper(K_dir) @ diag(f_up) @ K.T + diag(p_out)) @ diag(p_out)
 
     if not normalized and per_bus:
         Q = diag(p_out) @ Q
@@ -562,11 +566,13 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
             T = T.downstream if downstream else T.upstream
 
     else:
+        f = f_up if downstream else f_lo
+
         f = (n.branches().loc[branch_components]
                .assign(flow=f)
                .rename_axis(['component', 'branch_i'])
-               .set_index(['bus0', 'bus1'], append=True)['flow']
-               .pipe(set_cats, n))
+               .set_index(['bus0', 'bus1'], append=True)['flow'])
+#               .pipe(set_cats, n)
 
         # absolute flow with directions
         f_dir = pd.concat(
