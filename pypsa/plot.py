@@ -79,9 +79,9 @@ defs = pd.DataFrame({
 
 def plot(n, margin=0.05, ax=None,
          basemap=True, boundaries=None,
-         bus_sizes=10, bus_colors='grey', bus_cmap=None,
-         line_widths=1, line_colors='gold', line_cmap=None,
-         link_widths=1, link_colors='teal', link_cmap=None,
+         bus_sizes=10, bus_colors='coral', bus_cmap=None,
+         line_widths=1, line_colors='coral', line_cmap=None,
+         link_widths=1, link_colors='skyblue', link_cmap=None,
          flow=None, generation=None,
          title="", legend=True, geometry=False,
          branch_components=['Line', 'Link'], jitter=None):
@@ -389,9 +389,9 @@ def draw_map(network=None, jitter=None, ax=None, boundaries=None,
                         columns=['x', 'y', 'z'], index=network.buses.index)
         x, y = transformed.x, transformed.y
         ax.set_extent([x1, x2, y1, y2], crs=ccrs.PlateCarree())
-#        ax.coastlines(linewidth=0.4, zorder=-1, resolution=resolution)
+        ax.coastlines(linewidth=0.4, zorder=-1, resolution=resolution)
         border = cartopy.feature.BORDERS.with_scale(resolution)
-#        ax.add_feature(border, linewidth=0.3)
+        ax.add_feature(border, linewidth=0.3)
 
     return x, y
 

@@ -80,13 +80,13 @@ def cycles(n, dense=True, update=True):
         return n.C.T
 
 def active_cycles(n, snapshot):
-    f = pd.concat([n.lines_t.p0.loc[snapshot], n.links_t.p0.loc[snapshot]],
-              keys=['Line', 'Link'])
+#    f = pd.concat([n.lines_t.p0.loc[snapshot], n.links_t.p0.loc[snapshot]],
+#              keys=['Line', 'Link'])
 
     # copy original links
     orig_links = n.links.copy()
     # modify current links
-    n.links = n.links[f.Link.abs() >= 1e-8]
+    n.links = n.links[n.links_t.p0.loc[snapshot].abs() >= 1e-8]
     C = cycles(n, update=True)
     # reassign original links
     n.links = orig_links
@@ -126,7 +126,7 @@ def impedance(n, branch_components=['Line', 'Link'], snapshot=None):
                 @ C_mix[['Line']] @ diag(z) @ f[['Line']]
 
     omega = omega.round(10) #numerical issues either
-    omega[(omega == 0) & (f[['Link']] != 0)] = 1/f
+    omega[(omega == 0) & (f[['Link']] != 0)] = (1/f).fillna(0)
     return pd.concat([z, omega]).loc[branch_components]
 
 
@@ -518,26 +518,26 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
                   keys=branch_components, sort=True) \
           .rename_axis(['component', 'branch_i'])
 
-    f_up = f0.where(f0 > 0, - f1)
-    f_lo = f0.where(f0 < 0,  - f1)
+    f_in = f0.where(f0 > 0, - f1)
+    f_out = f0.where(f0 < 0,  - f1)
 
 
     p = network_injection(n, snapshot, branch_components).T
     if aggregated:
         p_in = p.clip(lower=0)  # nodal inflow
-        p_out = p.clip(upper=0).abs()  # nodal outflow
+        p_out = - p.clip(upper=0)  # nodal outflow
     else:
         p_in = power_production(n, [snapshot]).loc[snapshot]
         p_out = power_demand(n, [snapshot]).loc[snapshot]
 
     K = incidence_matrix(n, branch_components)
 
-    K_dir = K @ diag(sign(f_up))
+    K_dir = K @ diag(sign(f_in))
 
 #    Tau = lower(K_loss_dir) * f @ K.T + diag(p_in)
 
-    Q = inv(lower(K_dir) @ diag(f_lo) @ K.T + diag(p_in)) @ diag(p_in)
-    R = inv(upper(K_dir) @ diag(f_up) @ K.T + diag(p_out)) @ diag(p_out)
+    Q = inv(lower(K_dir) @ diag(f_out) @ K.T + diag(p_in)) @ diag(p_in)
+    R = inv(upper(K_dir) @ diag(f_in) @ K.T + diag(p_out)) @ diag(p_out)
 
     if not normalized and per_bus:
         Q = diag(p_out) @ Q
@@ -566,7 +566,7 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
             T = T.downstream if downstream else T.upstream
 
     else:
-        f = f_up if downstream else f_lo
+        f = f_in if downstream else f_out
 
         f = (n.branches().loc[branch_components]
                .assign(flow=f)
@@ -853,6 +853,78 @@ def zbus_transmission(n, snapshot=None):
 
     return pd.concat([q], keys=[snapshot], names=['snapshot'])
 
+
+def with_and_without_transit(n, snapshots=None,
+                             branch_components=['Line', 'Link']):
+    if not n.links.empty:
+        from pypsa.allocation import admittance, incidence_matrix, diag, pinv
+        Y = pd.concat([admittance(n, branch_components, sn)
+                       for sn in snapshots], axis=1,
+                       keys=snapshots)
+        def dynamic_subnetwork_PTDF(K, branches_i, snapshot):
+            y = Y.loc[branches_i, snapshot]
+            return diag(y) @ K.T @ pinv(K @ diag(y) @ K.T)
+
+
+    def regional_with_and_withtout_flow(region):
+        print(region, '\n')
+        in_region_buses = n.buses.query('country == @region').index
+        vicinity_buses = pd.Index(
+                            pd.concat(
+                            [n.branches()[lambda df:
+                                df.bus0.map(n.buses.country) == region].bus1,
+                             n.branches()[lambda df:
+                                 df.bus1.map(n.buses.country) == region].bus0]))\
+                            .difference(in_region_buses)
+        buses_i = in_region_buses.union(vicinity_buses).drop_duplicates()
+
+
+        region_branches = n.branches()[lambda df:
+                            (df.bus0.map(n.buses.country) == region) |
+                            (df.bus1.map(n.buses.country) == region)] \
+                            .rename_axis(['component', 'branch_i'])
+        branches_i = region_branches.index
+
+        K = incidence_matrix(n, branch_components).loc[buses_i, branches_i]
+
+        #create regional injection pattern with nodal injection at the border
+        #accounting for the cross border flow
+        f = pd.concat([n.pnl(c).p0.loc[snapshots].T for c in branch_components],
+                      keys=branch_components, sort=True).reindex(branches_i)
+
+        p = (K @ f)
+        p.loc[in_region_buses] >> \
+            network_injection(n, snapshots).loc[snapshots, in_region_buses].T
+
+        #modified injection pattern without transition
+        im = p.loc[vicinity_buses][lambda ds: ds > 0]
+        ex = p.loc[vicinity_buses][lambda ds: ds < 0]
+
+        largerImport_b = im.sum() > - ex.sum()
+        scaleImport = (im.sum() + ex.sum()) / im.sum()
+        scaleExport = (im.sum() + ex.sum()) / ex.sum()
+        netImOrEx = (im * scaleImport).T\
+                    .where(largerImport_b, (ex * scaleExport).T)
+        p_wo = pd.concat([p.loc[in_region_buses], netImOrEx.T])\
+                 .reindex(buses_i).fillna(0)
+
+        if 'Link' not in f.index.unique('component'):
+            y = admittance(n, ['Line'])[branches_i]
+            H = diag(y) @ K.T @ pinv(K @ diag(y) @ K.T)
+            f_wo = H @ p_wo
+    #        f >> H @ p
+        else:
+            f_wo = pd.concat(
+                    (dynamic_subnetwork_PTDF(K, branches_i, sn) @ p_wo[sn]
+                        for sn in snapshots), axis=1, keys=snapshots)
+
+
+        f, f_wo = f.T, f_wo.T
+        loss_with = f ** 2 @ n.branches().loc[branches_i, 'r_pu'].fillna(0)
+        loss_wo = f_wo ** 2 @ n.branches().loc[branches_i, 'r_pu'].fillna(0)
+        loss = pd.concat([loss_with, loss_wo], axis=1, keys=['with', 'without'])
+        flow = pd.concat([f, f_wo], axis=1, keys=['with', 'without'])
+        return {'flow': flow, 'loss': loss}
 
 
 def marginal_welfare_contribution(n, snapshots=None, formulation='kirchhoff',
