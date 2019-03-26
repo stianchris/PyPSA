@@ -84,7 +84,8 @@ def plot(n, margin=0.05, ax=None,
          link_widths=1, link_colors='skyblue', link_cmap=None,
          flow=None, generation=None,
          title="", legend=True, geometry=False,
-         branch_components=['Line', 'Link'], jitter=None):
+         branch_components=['Line', 'Link'], jitter=None,
+         basemap_kwargs={}):
     """
     Plot the network buses and lines using matplotlib and Basemap.
 
@@ -161,7 +162,8 @@ def plot(n, margin=0.05, ax=None,
                     'subplot_kw={"projection":ccrs.PlateCarree()})')
 
     if basemap:
-        x, y = draw_map(n, jitter, ax, boundaries, margin, basemap)
+        x, y = draw_map(n, jitter, ax, boundaries, margin, basemap,
+                        **basemap_kwargs)
     else:
         x, y = n.buses['x'], n.buses['y']
 
@@ -194,7 +196,7 @@ def plot(n, margin=0.05, ax=None,
                 ax.legend(handles=handles, edgecolor='w',
                           facecolor='inherit', fancybox=True,
                           labels=labels,
-                          loc=2, framealpha=1))
+                          loc=2, framealpha=0.7))
 
         bus_sizes = bus_sizes.sort_index(level=0, sort_remaining=False) \
                           * boundary_area_factor(ax)**2
@@ -295,11 +297,11 @@ def plot(n, margin=0.05, ax=None,
             l_collection.autoscale()
 
         ax.add_collection(l_collection)
-        l_collection.set_zorder(2)
+        l_collection.set_zorder(3)
 
         branch_collections.append(l_collection)
 
-    bus_collection.set_zorder(3)
+    bus_collection.set_zorder(4)
 
     ax.update_datalim(compute_bbox_with_margins(margin, x, y))
     ax.autoscale_view()
@@ -353,7 +355,7 @@ def boundary_area_factor(ax):
 
 
 def draw_map(network=None, jitter=None, ax=None, boundaries=None,
-             margin=0.05, basemap=True):
+             margin=0.05, basemap=True, coastline=True, border=True):
 
     x = network.buses["x"]
     y = network.buses["y"]
@@ -372,8 +374,8 @@ def draw_map(network=None, jitter=None, ax=None, boundaries=None,
         bmap = Basemap(resolution=resolution, epsg=network.srid,
                        llcrnrlat=y1, urcrnrlat=y2, llcrnrlon=x1,
                        urcrnrlon=x2, ax=ax)
-        bmap.drawcountries(linewidth=0.3, zorder=-1)
-        bmap.drawcoastlines(linewidth=0.4, zorder=-1)
+        bmap.drawcountries(linewidth=0.3, zorder=1)
+        bmap.drawcoastlines(linewidth=0.4, zorder=1)
 
         x, y = bmap(x.values, y.values)
         x = pd.Series(x, network.buses.index)
@@ -389,9 +391,11 @@ def draw_map(network=None, jitter=None, ax=None, boundaries=None,
                         columns=['x', 'y', 'z'], index=network.buses.index)
         x, y = transformed.x, transformed.y
         ax.set_extent([x1, x2, y1, y2], crs=ccrs.PlateCarree())
-        ax.coastlines(linewidth=0.4, zorder=-1, resolution=resolution)
-        border = cartopy.feature.BORDERS.with_scale(resolution)
-        ax.add_feature(border, linewidth=0.3)
+        if coastline:
+            ax.coastlines(linewidth=0.4, zorder=1, resolution=resolution)
+        if border:
+            border = cartopy.feature.BORDERS.with_scale(resolution)
+            ax.add_feature(border, linewidth=0.3, zorder=1)
 
     return x, y
 
@@ -478,7 +482,7 @@ def directed_flow(n, flow, x=None, y=None, ax=None,
                                color=fdata.color,
                                edgecolors='k',
                                linewidths=0.,
-                               zorder=2, alpha=1)
+                               zorder=3, alpha=1)
     ax.add_collection(arrowcol)
     return arrowcol
 
