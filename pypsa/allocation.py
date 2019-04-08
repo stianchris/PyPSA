@@ -9,6 +9,7 @@ Created on Wed Feb 21 12:14:49 2018
 # This side-package is created for use as flow and cost allocation.
 
 from .pf import calculate_PTDF, find_cycles
+from .descriptors import Dict
 from pandas import IndexSlice as idx
 import pandas as pd
 import numpy as np
@@ -163,27 +164,10 @@ def network_injection(n, snapshots=None, branch_components=['Link', 'Line']):
         snapshots = n.snapshots
     if isinstance(snapshots, pd.Timestamp):
         snapshots = [snapshots]
-    if branch_components == ['Line']:
-        return n.buses_t.p.loc[snapshots]
-    elif sorted(branch_components) == ['Line', 'Link']:
-        if 'p_n' not in n.buses_t.keys():
-            n.buses_t['p_n'] = (sum(n.pnl(l)['p{}'.format(i)]
-                                .groupby(n.df(l)['bus{}'.format(i)], axis=1)
-                                .sum()
-                                .reindex(columns=n.buses.index, fill_value=0)
-                                for l in ['Link', 'Line'] for i in [0, 1])
-                                .round(10))
-        return n.buses_t['p_n'].loc[snapshots].rename_axis('snapshot')
-    elif branch_components == ['Link']:
-        if 'p_link' not in n.buses_t.keys():
-            n.buses_t['p_link'] = (sum(n.pnl(l)['p{}'.format(i)]
-                                   .groupby(n.df(l)['bus{}'.format(i)], axis=1)
-                                   .sum()
-                                   .reindex(columns=n.buses.index,
-                                            fill_value=0)
-                                   for l in ['Link'] for i in [0, 1])
-                                   .round(10))
-        return n.buses_t['p_link'].loc[snapshots].rename_axis('snapshot')
+    f = pd.concat([n.pnl(c).p0.loc[snapshots].T for c in branch_components],
+                   keys=branch_components, sort=True)
+    K = incidence_matrix(n, branch_components)
+    return (K @ f).T
 
 
 def is_balanced(n, tol=1e-9):
@@ -594,7 +578,7 @@ def average_participation(n, snapshot, per_bus=False, normalized=False,
 
 
 def marginal_participation(n, snapshot=None, q=0.5, normalized=False,
-                           per_bus=False):
+                           per_bus=False, branch_components=['Link', 'Line']):
     '''
     Allocate line flows according to linear sensitvities of nodal power
     injection given by the changes in the power transfer distribution
@@ -635,11 +619,13 @@ def marginal_participation(n, snapshot=None, q=0.5, normalized=False,
 
     '''
     snapshot = n.snapshots[0] if snapshot is None else snapshot
-    H = PTDF(n)
-    p = n.buses_t.p.loc[snapshot]
+    H = PTDF(n, branch_components=branch_components, snapshot=snapshot)
+    K = incidence_matrix(n, branch_components=branch_components)
+    f = pd.concat([n.pnl(b).p0.loc[snapshot] for b in branch_components],
+                   keys=branch_components)
+    p = K @ f
     p_plus = p.clip(lower=0)
     p_minus = p.clip(upper=0)
-    f = n.lines_t.p0.loc[snapshot]
 #   unbalanced flow from positive injection:
     f_plus = H @ p_plus
     f_minus = H @ p_minus
@@ -664,7 +650,8 @@ def marginal_participation(n, snapshot=None, q=0.5, normalized=False,
 
 
 def virtual_injection_pattern(n, snapshot=None, normalized=False, per_bus=False,
-                              downstream=True):
+                              downstream=True,
+                              branch_components=['Line', 'Link']):
     """
     Sequentially calculate the load flow induced by individual
     power sources in the network ignoring other sources and scaling
@@ -688,11 +675,13 @@ def virtual_injection_pattern(n, snapshot=None, normalized=False, per_bus=False,
 
     """
     snapshot = n.snapshots[0] if snapshot is None else snapshot
-    H = PTDF(n)
-    p = n.buses_t.p.loc[snapshot]
+    H = PTDF(n, branch_components=branch_components, snapshot=snapshot)
+    f = pd.concat([n.pnl(b).p0.loc[snapshot] for b in branch_components],
+                   keys=branch_components)
+    K = incidence_matrix(n, branch_components=branch_components)
+    p = K @ f
     p_plus = p.clip(lower=0)
     p_minus = p.clip(upper=0)
-    f = n.lines_t.p0.loc[snapshot]
     if downstream:
         indiag = diag(p_plus)
         offdiag = (p_minus.to_frame().dot(p_plus.to_frame().T)
@@ -856,18 +845,19 @@ def zbus_transmission(n, snapshot=None):
 
 def with_and_without_transit(n, snapshots=None,
                              branch_components=['Line', 'Link']):
+    regions = n.buses.country.unique()
+
     if not n.links.empty:
         from pypsa.allocation import admittance, incidence_matrix, diag, pinv
         Y = pd.concat([admittance(n, branch_components, sn)
                        for sn in snapshots], axis=1,
                        keys=snapshots)
         def dynamic_subnetwork_PTDF(K, branches_i, snapshot):
-            y = Y.loc[branches_i, snapshot]
+            y = Y.loc[branches_i, snapshot].abs()
             return diag(y) @ K.T @ pinv(K @ diag(y) @ K.T)
 
 
     def regional_with_and_withtout_flow(region):
-        print(region, '\n')
         in_region_buses = n.buses.query('country == @region').index
         vicinity_buses = pd.Index(
                             pd.concat(
@@ -920,11 +910,17 @@ def with_and_without_transit(n, snapshots=None,
 
 
         f, f_wo = f.T, f_wo.T
-        loss_with = f ** 2 @ n.branches().loc[branches_i, 'r_pu'].fillna(0)
-        loss_wo = f_wo ** 2 @ n.branches().loc[branches_i, 'r_pu'].fillna(0)
-        loss = pd.concat([loss_with, loss_wo], axis=1, keys=['with', 'without'])
-        flow = pd.concat([f, f_wo], axis=1, keys=['with', 'without'])
-        return {'flow': flow, 'loss': loss}
+        return pd.concat([f, f_wo], axis=1, keys=['with', 'without'])
+#        return {'flow': flow, 'loss': loss}
+    flows = pd.concat((regional_with_and_withtout_flow(r) for r in regions),
+                      axis=1, keys=regions,
+                      names=['country', 'method', 'component', 'branch_i'])\
+                .reorder_levels(['country', 'component', 'branch_i', 'method'],
+                                axis=1).sort_index(axis=1)
+
+    r_pu = n.branches().r_pu.fillna(0).rename_axis(['component', 'branch_i'])
+    loss = (flows **2 * r_pu).sum(level=['country', 'method'], axis=1)
+    return Dict({'flow': flows, 'loss': loss})
 
 
 def marginal_welfare_contribution(n, snapshots=None, formulation='kirchhoff',
@@ -1008,7 +1004,7 @@ def flow_allocation(n, snapshots=None, method='Average participation',
     Function to allocate the total network flow to buses. Available
     methods are 'Average participation' ('ap'), 'Marginal
     participation' ('mp'), 'Virtual injection pattern' ('vip'),
-    'Minimal flow shares' ('mfs').
+    'Zbus transmission' ('zbus').
 
 
 
@@ -1068,6 +1064,8 @@ def flow_allocation(n, snapshots=None, method='Average participation',
         method_func = virtual_injection_pattern
     elif method in ['Minimal flow shares', 'mfs']:
         method_func = minimal_flow_shares
+    elif method in ['Zbus transmission', 'zbus']:
+        method_func = zbus_transmission
     else:
         raise(ValueError('Method not implemented, please choose one out of'
                          "['Average participation', "
