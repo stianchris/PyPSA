@@ -174,7 +174,7 @@ for line_name in ["316","527","602"]:
 
 group_size = 4
 
-solver_name = "gurobi"
+solver_name = "glpk"
 
 print("Performing linear OPF for one day, {} snapshots at a time:".format(group_size))
 
@@ -244,36 +244,42 @@ print("With the linear load flow, there is the following per unit loading:")
 loading = network.lines_t.p0.loc[now]/network.lines.s_nom
 print(loading.describe())
 
-fig,ax = plt.subplots(1,1, subplot_kw={"projection":ccrs.PlateCarree()})
-fig.set_size_inches(6,6)
+#-----------------------------------------------------------------------------
+#line loading
+fig,ax = plt.subplots(1,1, subplot_kw={"projection":ccrs.PlateCarree()},
+                                       figsize=(6,4))
 
-network.plot(ax=ax,line_colors=abs(loading),line_cmap=plt.cm.jet,title="Line loading")
-
+nplot = network.plot(ax=ax,line_colors=abs(loading), bus_colors='grey',
+                     bus_sizes=0.5,
+                     line_cmap=plt.cm.jet,title="Line loading")
+cb = fig.colorbar(nplot[1])
+cb.outline.set_visible(False)
 fig.tight_layout()
 fig.savefig("line-loading.png")
 
 network.buses_t.marginal_price.loc[now].describe()
 
-fig,ax = plt.subplots(1,1, subplot_kw={"projection":ccrs.PlateCarree()})
-fig.set_size_inches(6,4)
-
+#%%
+#-----------------------------------------------------------------------------
+#marginal prices
+fig,ax = plt.subplots(1,1, subplot_kw={"projection":ccrs.PlateCarree()},
+                                       figsize=(6,4))
 
 network.plot(ax=ax,line_widths=pd.Series(0.5,network.lines.index))
-plt.hexbin(network.buses.x, network.buses.y,
+hbin = ax.hexbin(network.buses.x, network.buses.y,
            gridsize=20,
            C=network.buses_t.marginal_price.loc[now],
            cmap=plt.cm.jet)
 
-#for some reason the colorbar only works with graphs plt.plot
-#and must be attached plt.colorbar
-
-cb = plt.colorbar()
+cb = fig.colorbar(hbin)
 cb.set_label('Locational Marginal Price (EUR/MWh)')
+cb.outline.set_visible(False)
 
 fig.tight_layout()
 fig.savefig('lmp.png')
-
-### Look at variable curtailment
+#%%
+#------------------------------------------------------------------------------
+# variable curtailment
 
 carrier = "Wind Onshore"
 
@@ -305,8 +311,8 @@ ax.legend()
 
 fig.tight_layout()
 fig.savefig("scigrid-curtailment.png")
-
-## Check power flow
+#-----------------------------------------------------------------------------
+# Check power flow
 
 now = network.snapshots[0]
 
@@ -321,6 +327,7 @@ for bus in network.buses.index:
     if abs(bus_sum-branches_sum) > 1e-4:
         print(bus,bus_sum,branches_sum)
 
+#-----------------------------------------------------------------------------
 ### Now perform a full Newton-Raphson power flow on the first hour
 
 #For the PF, set the P to the optimised P
@@ -363,6 +370,9 @@ s = df[str(now)+"_x"]- df[str(now)+"_y"]
 print("The voltage angle differences across the lines have (in degrees):")
 print((s*180/np.pi).describe())
 
+
+#-----------------------------------------------------------------------------
+#%%
 #plot the reactive power
 
 fig,ax = plt.subplots(1,1, subplot_kw={"projection":ccrs.PlateCarree()})
