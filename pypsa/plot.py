@@ -195,8 +195,8 @@ def plot(n, margin=0.05, ax=None,
             ax.add_artist(
                 ax.legend(handles=handles, edgecolor='w',
                           facecolor='inherit', fancybox=True,
-                          labels=labels,
-                          loc=2, framealpha=0.7))
+                          labels=labels, bbox_to_anchor=(1,1),
+                          loc='upper left', framealpha=0.7))
 
         bus_sizes = bus_sizes.sort_index(level=0, sort_remaining=False) \
                           * boundary_area_factor(ax)**2
@@ -355,7 +355,8 @@ def boundary_area_factor(ax):
 
 
 def draw_map(network=None, jitter=None, ax=None, boundaries=None,
-             margin=0.05, basemap=True, coastline=True, border=True):
+             margin=0.05, basemap=True, coastline=True, border=True,
+             color_geomap=True):
 
     x = network.buses["x"]
     y = network.buses["y"]
@@ -391,6 +392,15 @@ def draw_map(network=None, jitter=None, ax=None, boundaries=None,
                         columns=['x', 'y', 'z'], index=network.buses.index)
         x, y = transformed.x, transformed.y
         ax.set_extent([x1, x2, y1, y2], crs=ccrs.PlateCarree())
+        if color_geomap is None:
+            color_geomap = {'ocean': 'w', 'land': 'w'}
+        elif color_geomap and not isinstance(color_geomap, dict):
+            color_geomap = {'ocean': 'lightblue', 'land': 'whitesmoke'}
+
+        ax.add_feature(cartopy.feature.LAND.with_scale(resolution),
+                        facecolor=color_geomap['land'])
+        ax.add_feature(cartopy.feature.OCEAN.with_scale(resolution),
+                        facecolor=color_geomap['ocean'])
         if coastline:
             ax.coastlines(linewidth=0.4, zorder=1, resolution=resolution)
         if border:
