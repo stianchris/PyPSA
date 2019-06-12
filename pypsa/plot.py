@@ -188,8 +188,6 @@ def plot(network, margin=0.05, ax=None, geomap=True, projection=None,
 
     x, y = network.buses["x"],  network.buses["y"]
 
-    axis_transform = ax.transData
-
     if geomap:
         if use_cartopy:
             axis_transform = draw_map_cartopy(network, x, y, ax,
@@ -198,7 +196,7 @@ def plot(network, margin=0.05, ax=None, geomap=True, projection=None,
                     ax.projection.transform_points(axis_transform,
                                                    x.values, y.values),
                        index=network.buses.index, columns=['x', 'y', 'z'])
-            x, y = new_coords['x'], new_coords['y']
+            x, y = new_coords.x, new_coords.y
         elif use_basemap:
             basemap_transform = draw_map_basemap(network, x, y, ax,
                     boundaries, margin, geomap, basemap_parameters, color_geomap)
@@ -277,11 +275,10 @@ def plot(network, margin=0.05, ax=None, geomap=True, projection=None,
         flow = get_flow_data_from_arg(flow, network, branch_components)
         arrow_scale = (len(network.branches()) + 100) / line_widths
         flow = flow.div(arrow_scale)
-        line_widths = (5 * flow.abs()).pipe(np.sqrt)#.clip(lower=branch_widths)
+        line_widths.update((5 * flow.abs()).pipe(np.sqrt))#.clip(lower=branch_widths)
         arrows = directed_flow(network, flow, x=x, y=y, ax=ax,
                                branch_colors=line_colors,
-                               branch_comps=branch_components,
-                               transform=axis_transform)
+                               branch_comps=branch_components)
         branch_collections.append(arrows)
 
     for c in network.iterate_components(branch_components):
@@ -322,7 +319,6 @@ def plot(network, margin=0.05, ax=None, geomap=True, projection=None,
             l_collection.set_array(np.asarray(l_nums))
             l_collection.set_cmap(line_cmap.get(c.name, None))
             l_collection.autoscale()
-
         ax.add_collection(l_collection)
         l_collection.set_zorder(3)
 
@@ -482,8 +478,7 @@ def get_flow_data_from_arg(flow, n, branch_components):
                 .agg(flow, axis=0))
 
 def directed_flow(n, flow, x=None, y=None, ax=None,
-                  branch_colors='darkgreen', branch_comps=['Line', 'Link'],
-                  transform=None):
+                  branch_colors='darkgreen', branch_comps=['Line', 'Link']):
     """
     Helper function to generate arrows from flow data.
     """
@@ -535,8 +530,7 @@ def directed_flow(n, flow, x=None, y=None, ax=None,
                                color=fdata.color,
                                edgecolors='k',
                                linewidths=0.,
-                               zorder=3, alpha=1,
-                               transform=transform)
+                               zorder=3, alpha=1)
     ax.add_collection(arrowcol)
     return arrowcol
 

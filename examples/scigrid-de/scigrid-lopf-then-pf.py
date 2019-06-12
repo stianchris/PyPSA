@@ -80,6 +80,8 @@ import cartopy.crs as ccrs
 #you downloaded the github repository
 #https://github.com/PyPSA/PyPSA
 
+plt.rcParams['savefig.dpi'] = 250
+
 csv_folder_name = os.path.dirname(pypsa.__file__) + "/../examples/scigrid-de/scigrid-with-load-gen-trafos/"
 
 network = pypsa.Network(csv_folder_name=csv_folder_name)
@@ -144,7 +146,7 @@ for i,tech in enumerate(techs):
 
     ax.set_title(tech)
 
-#%%
+
 
 ### Run Linear Optimal Power Flow on the first day of 2011
 
@@ -206,57 +208,56 @@ cols = ["Nuclear","Run of River","Brown Coal","Hard Coal",
         "Gas","Wind Offshore","Wind Onshore","Solar"]
 p_by_carrier = p_by_carrier[cols]
 
-fig,ax = plt.subplots()
-
-fig.set_size_inches(12,6)
-
-(p_by_carrier/1e3).plot(kind="area",ax=ax,linewidth=4,colors=[colors[col] for col in p_by_carrier.columns])
+fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(10,6),
+                              gridspec_kw={'height_ratios':[2,1]})
 
 
-ax.legend(ncol=4,loc="upper left")
+(p_by_carrier/1e3).plot(kind="area",ax=ax1,linewidth=4,colors=[colors[col] for col in p_by_carrier.columns])
 
-ax.set_ylabel("GW")
+handles, labels = ax1.get_legend_handles_labels()
+ax1.legend(reversed(handles), reversed(labels),
+           ncol=1,loc="upper left", bbox_to_anchor=(1,1),
+           labelspacing=2, frameon=False)
 
-ax.set_xlabel("")
+ax1.set_ylabel("GW")
 
-fig.tight_layout()
-fig.savefig("stacked-gen.png")
+#fig.savefig("stacked-gen.png")
 
-fig,ax = plt.subplots()
-fig.set_size_inches(12,6)
 
 p_storage = network.storage_units_t.p.sum(axis=1)
 state_of_charge = network.storage_units_t.state_of_charge.sum(axis=1)
-p_storage.plot(label="Pumped hydro dispatch",ax=ax,linewidth=3)
-state_of_charge.plot(label="State of charge",ax=ax,linewidth=3)
+p_storage.plot(label="Pumped hydro dispatch",ax=ax2,linewidth=3)
+state_of_charge.plot(label="State of charge",ax=ax2,linewidth=3)
 
-ax.legend()
-ax.grid()
-ax.set_ylabel("MWh")
-ax.set_xlabel("")
+handles, labels = ax2.get_legend_handles_labels()
+ax2.legend(reversed(handles), reversed(labels),
+           ncol=1,loc="lower left", bbox_to_anchor=(1,0),
+           labelspacing=2, frameon=False)
+ax2.grid(linestyle='dashed')
+ax2.set_ylabel("MWh")
+ax2.set_xlabel("")
 
 fig.tight_layout()
-fig.savefig("storage-scigrid.png")
+fig.savefig("stacked-gen_and_storage-scigrid.png", bbox_inches='tight')
 
 now = network.snapshots[4]
 
 print("With the linear load flow, there is the following per unit loading:")
 loading = network.lines_t.p0.loc[now]/network.lines.s_nom
 print(loading.describe())
-#%%
 #-----------------------------------------------------------------------------
 #line loading
 fig, (ax1, ax2) = plt.subplots(1,2, subplot_kw={"projection":ccrs.PlateCarree()},
-                                       figsize=(12,6))
+                                       figsize=(10,4))
 
-nplot = network.plot(ax=ax,line_colors=abs(loading), bus_colors='grey',
-                     bus_sizes=0.5,
+nplot = network.plot(ax=ax1,line_colors=abs(loading), bus_colors='grey',
+                     bus_sizes=0.5, geomap='10m',
                      line_cmap=plt.cm.jet,title="Line loading")
-cb = fig.colorbar(nplot[1])
+cb = fig.colorbar(nplot[1], ax=ax1)
 cb.set_label('Relative line loading')
 cb.outline.set_visible(False)
 fig.canvas.draw(); fig.tight_layout()
-fig.savefig("line-loading.png")
+#fig.savefig("line-loading.png")
 
 network.buses_t.marginal_price.loc[now].describe()
 
@@ -265,20 +266,20 @@ network.buses_t.marginal_price.loc[now].describe()
 #fig,ax = plt.subplots(1,1, subplot_kw={"projection":ccrs.PlateCarree()},
 #                                       figsize=(6,4))
 
-network.plot(ax=ax,line_widths=pd.Series(0.5,network.lines.index),
+network.plot(ax=ax2,line_widths=pd.Series(0.5,network.lines.index),
+             geomap='10m',
              title='Locational Marginal Price', bus_sizes=0)
-hbin = ax.hexbin(network.buses.x, network.buses.y,
+hbin = ax2.hexbin(network.buses.x, network.buses.y,
            gridsize=20,
            C=network.buses_t.marginal_price.loc[now],
            cmap=plt.cm.jet)
 
-cb = fig.colorbar(hbin)
+cb = fig.colorbar(hbin, ax=ax2)
 cb.set_label('EUR/MWh')
 cb.outline.set_visible(False)
 
 fig.canvas.draw(); fig.tight_layout()
-fig.savefig('lmp.png')
-#%%
+fig.savefig('lmp_and_line-loading.png')
 #------------------------------------------------------------------------------
 # variable curtailment
 
@@ -301,7 +302,7 @@ p_df[carrier + " capacity"] = capacity
 p_df["Wind Onshore curtailed"][p_df["Wind Onshore curtailed"] < 0.] = 0.
 
 fig,ax = plt.subplots()
-fig.set_size_inches(12,6)
+fig.set_size_inches(10,5)
 p_df[[carrier + " dispatched",carrier + " curtailed"]].plot(kind="area",ax=ax,linewidth=3)
 p_df[[carrier + " available",carrier + " capacity"]].plot(ax=ax,linewidth=3)
 
@@ -373,12 +374,12 @@ print((s*180/np.pi).describe())
 
 
 #-----------------------------------------------------------------------------
-#%%
+
 #plot the reactive power
 
 fig,ax = plt.subplots(1,1, subplot_kw={"projection":ccrs.PlateCarree()})
 
-fig.set_size_inches(6,6)
+fig.set_size_inches(8,6)
 
 q = network.buses_t.q.loc[now]
 
@@ -387,8 +388,10 @@ bus_colors[q< 0.] = "b"
 
 
 network.plot(bus_sizes=abs(q),ax=ax,bus_colors=bus_colors,
+             line_widths=0.1, geomap='10m', color_geomap=True,
              title="Reactive power feed-in (red=+ve, blue=-ve)")
 
+fig.canvas.draw()
 fig.tight_layout()
 fig.savefig("reactive-power.png")
 
