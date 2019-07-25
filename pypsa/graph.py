@@ -20,30 +20,26 @@
 
 import scipy as sp, scipy.sparse
 import numpy as np
+import networkx as nx
 
 from .descriptors import OrderedGraph
 
 def graph(network, branch_components=None, weight=None, inf_weight=False):
     """
     Build NetworkX graph.
-
     Parameters
     ----------
     network : Network|SubNetwork
-
     branch_components : [str]
         Components to use as branches. The default are
         passive_branch_components in the case of a SubNetwork and
         branch_components in the case of a Network.
-
     weight : str
         Branch attribute to use as weight
-
     inf_weight : bool|float
         How to treat infinite weights (default: False). True keeps the infinite
         weight. False skips edges with infinite weight. If a float is given it
         is used instead.
-
     Returns
     -------
     graph : OrderedGraph
@@ -88,6 +84,76 @@ def graph(network, branch_components=None, weight=None, inf_weight=False):
     graph.add_edges_from(gen_edges())
 
     return graph
+
+
+def write_shape(network,
+                branch_components=None,
+                shape_folder_name):
+    """
+    Write Shape-files from NetworkX DiGraph into a specified shape-folder.
+    This function is still under development and does not yet support the
+    export of attributes.
+
+    Arguments
+    ---------
+    network : Network|SubNetwork
+
+    branch_components : [str]
+        Components to use as branches. The default are
+        passive_branch_components in the case of a SubNetwork and
+        branch_components in the case of a Network.
+
+    shape_folder_name : str
+        Name of the folder to be exported to.
+
+    Returns
+    -------
+    graph : DiGraph
+        NetworkX graph
+    """
+
+    from . import components
+
+    if isinstance(network, components.Network):
+        if branch_components is None:
+            branch_components = network.branch_components
+        buses_i = network.buses.index
+    elif isinstance(network, components.SubNetwork):
+        if branch_components is None:
+            branch_components = network.network.passive_branch_components
+        buses_i = network.buses_i()
+    else:
+        raise TypeError("graph must be called with a Network or a SubNetwork")
+
+    graph = nx.DiGraph()
+
+    # add nodes first, in case there are isolated buses not connected with branches
+    graph.add_nodes_from(buses_i)
+
+    # DiGraph just uses the nodes as keys - no attributes included yet!
+    # TODO: add attributes
+    for c in network.iterate_components(branch_components):
+        for branch in c.df.loc[slice(None) if c.ind is None
+                                           else c.ind].itertuples():
+#            graph.add_edge(branch.bus0, branch.bus1,attr_dict={'name':c.name,'ID':branch.Index})
+            graph.add_edge(branch.bus0, branch.bus1)
+
+    # relabel the nodes with an (x,y) tuple, to be able to export it to shape
+    if not network.buses.x.empty:
+        mapping = {}
+        for d in list(graph.nodes(data=True)):
+            # to be imported in QGIS, longlat is used instead of latlong - x and y are exchanged
+            y = network.buses.x[d[0]]
+            x = network.buses.y[d[0]]
+            co_od=(x,y)
+            nx.set_node_attributes(graph, name='node_id', values={d[0]: d[0]})
+            mapping[d[0]] = co_od
+        graph=nx.relabel_nodes(graph, mapping)
+    else:
+        print('no coordinates given! buses.x is empty.')
+
+    nx.write_shp(graph, shape_folder_name)
+
 
 def adjacency_matrix(network, branch_components=None, busorder=None, weights=None):
     """
