@@ -86,30 +86,30 @@ def graph(network, branch_components=None, weight=None, inf_weight=False):
     return graph
 
 
-def write_shape(network,
-                branch_components=None,
-                shape_folder_name):
+def write_shape(network, shape_folder_name, branch_components=None):
     """
     Write Shape-files from NetworkX DiGraph into a specified shape-folder.
-    This function is still under development and does not yet support the
-    export of attributes.
+    This function is still under development. The only attributes exported are
+    name of buses and lines/links as ID.
+    X and Y coordinates should refer to latlong. The function changes them to
+    longlat, as this is also used e.g. by QGIS, and OSM.
+    To import to any GIS software use the WGS 84 profile (EPSG: 4326).
 
     Arguments
     ---------
     network : Network|SubNetwork
+
+    shape_folder_name : str
+        Name of the folder to be exported to.
 
     branch_components : [str]
         Components to use as branches. The default are
         passive_branch_components in the case of a SubNetwork and
         branch_components in the case of a Network.
 
-    shape_folder_name : str
-        Name of the folder to be exported to.
-
     Returns
     -------
-    graph : DiGraph
-        NetworkX graph
+    
     """
 
     from . import components
@@ -135,8 +135,8 @@ def write_shape(network,
     for c in network.iterate_components(branch_components):
         for branch in c.df.loc[slice(None) if c.ind is None
                                            else c.ind].itertuples():
-#            graph.add_edge(branch.bus0, branch.bus1,attr_dict={'name':c.name,'ID':branch.Index})
-            graph.add_edge(branch.bus0, branch.bus1)
+            graph.add_edge(branch.bus0, branch.bus1, ID=branch.Index)
+    
 
     # relabel the nodes with an (x,y) tuple, to be able to export it to shape
     if not network.buses.x.empty:
